@@ -497,6 +497,11 @@ def subject_cloth():
     bpy.ops.object.modifier_add(type="SUBSURF")
     cloth.modifiers[-1].levels = 5
     cloth.modifiers[-1].subdivision_type = "SIMPLE"
+    tex = bpy.data.textures.new("folds", "CLOUDS")
+    tex.noise_scale = R.uniform(0.15, 0.4)
+    disp = cloth.modifiers.new("folds", "DISPLACE")
+    disp.texture = tex
+    disp.strength = R.uniform(0.05, 0.2)
     wave = cloth.modifiers.new("wave", "WAVE")
     wave.height = R.uniform(0.02, 0.08)
     wave.width = R.uniform(0.2, 0.6)
@@ -506,8 +511,10 @@ def subject_cloth():
     m.use_nodes = True
     nt = m.node_tree
     b = nt.nodes["Principled BSDF"]
-    c = (R.random(), R.random(), R.random())
+    hue = np.array([R.random(), R.random(), R.random()])
+    c = tuple(0.03 + 0.5 * hue / hue.max() * R.uniform(0.2, 1.0))
     b.inputs["Base Color"].default_value = (*c, 1)
+    b.inputs["Sheen Weight"].default_value = R.uniform(0.0, 0.6)
     b.inputs["Roughness"].default_value = 0.7
     weave = nt.nodes.new("ShaderNodeTexWave" if R.random() < 0.5 else "ShaderNodeTexVoronoi")
     weave.inputs["Scale"].default_value = R.uniform(20, 120)
