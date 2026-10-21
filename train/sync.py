@@ -63,11 +63,8 @@ def main():
         avg = {}
         for k in states[0]["w"]:
             avg[k] = sum(s["w"][k].float() for s in states).div_(len(states)).half()
-        ema = {}
-        for k in states[0]["ema"]:
-            ema[k] = sum(s["ema"][k].float() for s in states).div_(len(states)).half()
         tmp = d / f".avg_r{r}.pt"
-        torch.save({"w": avg, "ema": ema, "n": len(states)}, tmp)
+        torch.save({"w": avg, "n": len(states)}, tmp)
         tmp.rename(d / f"avg_r{r}.pt")
         for rem in remotes:
             if rem not in pending:

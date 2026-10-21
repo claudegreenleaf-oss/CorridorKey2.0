@@ -163,7 +163,7 @@ def local_sgd_sync(named, ema, args, rnd):
     d.mkdir(parents=True, exist_ok=True)
     mine = {n: p.detach().to("cpu", torch.float16) for n, p in named.items()}
     tmp = d / f".w{args.rank}_r{rnd}.pt"
-    torch.save({"w": mine, "ema": {n: v.to("cpu", torch.float16) for n, v in ema.items()}}, tmp)
+    torch.save({"w": mine}, tmp)
     tmp.rename(d / f"w{args.rank}_r{rnd}.pt")
     avg = d / f"avg_r{rnd}.pt"
     t0 = time.time()
@@ -176,7 +176,6 @@ def local_sgd_sync(named, ema, args, rnd):
     with torch.no_grad():
         for n, p in named.items():
             p.copy_(st["w"][n].to(p.dtype))
-            ema[n].copy_(st["ema"][n].float())
     print(f"sync round {rnd}: averaged over {st.get('n', '?')} workers", flush=True)
 
 
@@ -254,7 +253,7 @@ def main():
         with torch.no_grad():
             for n, p in named.items():
                 p.copy_(st["w"][n].to(p.dtype))
-                ema[n].copy_(st["ema"][n].float())
+                ema[n].copy_(p.detach().float())
         print(f"initialised from {args.init_avg}", flush=True)
     ds = KeyingClips(args.data, crop_hw=tuple(args.crop), T=args.T, seed=step + 1 + 1000003 * args.rank)
     dl = DataLoader(ds, batch_size=1, num_workers=args.workers, prefetch_factor=4,
