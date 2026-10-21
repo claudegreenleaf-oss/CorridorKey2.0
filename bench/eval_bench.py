@@ -153,7 +153,7 @@ def main():
     ap.add_argument("--frame_stride", type=int, default=1)
     args = ap.parse_args()
 
-    scores = {}
+    jobs = []
     for case_dir in sorted(p for p in args.bench.iterdir() if (p / "case.json").exists()):
         if args.only and case_dir.name not in args.only:
             continue
@@ -161,9 +161,14 @@ def main():
         if not out_case.exists():
             print(f"skip {case_dir.name}: no results")
             continue
-        s, _ = score_case(case_dir, out_case, args.frame_stride)
-        scores[case_dir.name] = s
-        print(f"{case_dir.name:26s} " + " ".join(f"{m}={s[m]:.3f}" for m in METRICS), flush=True)
+        jobs.append((case_dir, out_case))
+    from concurrent.futures import ProcessPoolExecutor
+    with ProcessPoolExecutor(max_workers=min(len(jobs), 16) or 1) as pool:
+        futs = {pool.submit(score_case, c, o, args.frame_stride): c.name for c, o in jobs}
+        results = {futs[f]: f.result()[0] for f in futs}
+    scores = {k: results[k] for k in sorted(results)}
+    for name, s in scores.items():
+        print(f"{name:26s} " + " ".join(f"{m}={s[m]:.3f}" for m in METRICS), flush=True)
     (args.results / "scores.json").write_text(json.dumps(scores, indent=1))
 
 
