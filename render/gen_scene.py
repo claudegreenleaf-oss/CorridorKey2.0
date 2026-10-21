@@ -572,9 +572,54 @@ def subject_particles():
     return root
 
 
+def subject_threads():
+    """Sub-pixel threads: an orb web (radials + spiral), or loose fibres."""
+    root = bpy.data.objects.new("threads", None)
+    bpy.context.collection.objects.link(root)
+    m = bpy.data.materials.new("silk")
+    m.use_nodes = True
+    b = m.node_tree.nodes["Principled BSDF"]
+    g = R.uniform(0.5, 0.95)
+    b.inputs["Base Color"].default_value = (g, g, g * R.uniform(0.9, 1.0), 1)
+    b.inputs["Roughness"].default_value = R.uniform(0.2, 0.6)
+    b.inputs["Transmission Weight"].default_value = R.uniform(0.0, 0.5)
+    strands = []
+    if R.random() < 0.6:
+        n_rad = R.randint(12, 30)
+        r_max = 0.5
+        for i in range(n_rad):
+            ang = 2 * math.pi * i / n_rad + R.gauss(0, 0.05)
+            p = np.linspace(0, 1, 12)[:, None] * np.array([math.cos(ang), 0, math.sin(ang)]) * r_max
+            p += NP.normal(0, 0.003, p.shape)
+            strands.append(p)
+        turns = R.uniform(8, 25)
+        t = np.linspace(0.05, 1, 1200)
+        spiral = np.stack([np.cos(2 * np.pi * turns * t) * t * r_max, NP.normal(0, 0.002, t.size),
+                           np.sin(2 * np.pi * turns * t) * t * r_max], 1)
+        for i in range(0, spiral.shape[0] - 40, 40):
+            strands.append(spiral[i:i + 41])
+        kind = "orb_web"
+    else:
+        for _ in range(R.randint(30, 200)):
+            a = NP.uniform(-0.5, 0.5, 3)
+            d = NP.normal(0, 1, 3)
+            d /= np.linalg.norm(d)
+            L = R.uniform(0.2, 1.0)
+            t = np.linspace(0, 1, 16)[:, None]
+            sag = np.array([0, 0, -1.0]) * (t * (1 - t)) * R.uniform(0, 0.15)
+            strands.append(a + d * L * t + sag + NP.normal(0, 0.002, (16, 3)))
+        kind = "fibres"
+    k = max(len(p) for p in strands)
+    pts = np.stack([np.vstack([p, np.repeat(p[-1:], k - len(p), 0)]) for p in strands]).astype(np.float32)
+    o = add_hair_object("threads", pts, R.uniform(0.0002, 0.0008), m)
+    o.parent = root
+    META["layers"].append({"type": "threads", "kind": kind, "count": len(strands)})
+    return root
+
+
 PRIMARY = [(subject_hair_head, 0.35), (subject_fur_shape, 0.15), (subject_model, 0.25),
            (subject_glass, 0.08), (subject_cloth, 0.07), (lambda: subject_smoke(False), 0.06),
-           (lambda: subject_smoke(True), 0.04)]
+           (lambda: subject_smoke(True), 0.04), (subject_threads, 0.12)]
 SECONDARY = [(lambda: subject_smoke(False), 0.4), (subject_particles, 0.35), (subject_cloth, 0.25)]
 
 
