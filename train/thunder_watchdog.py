@@ -52,6 +52,8 @@ def main():
             reason = "manual stop"
         elif running and st["last_seen"] and now - st["last_seen"] > a.stall * 60:
             reason = f"worker stalled ({(now - st['last_seen']) / 60:.0f} min without a sync file)"
+        elif running and not st["last_seen"] and st["running_s"] > a.stall * 60:
+            reason = f"worker never produced a sync file in {a.stall:.0f} min"
         st["spend"] = round(spend, 2)
         a.state.write_text(json.dumps(st))
         if reason:
