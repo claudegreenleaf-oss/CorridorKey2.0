@@ -246,14 +246,19 @@ def groom(roots, normals, scale, style, length, n_pts=14):
     """Strand polylines (n, n_pts, 3) from roots and normals."""
     n = len(roots)
     up = np.array([0, 0, 1], np.float32)
-    grav = R.uniform(0.3, 0.9) if style != "fur" else 0.05
+    grav = R.uniform(0.6, 0.95) if style != "fur" else 0.05
     L = length * scale * NP.uniform(0.7, 1.15, n)
     t = np.linspace(0, 1, n_pts, dtype=np.float32)
     # clumps: strands follow a nearby guide's direction noise
     n_cl = max(8, n // R.randint(60, 400))
     cl = NP.integers(0, n_cl, n)
     cl_phase = NP.uniform(0, 2 * np.pi, (n_cl, 2)).astype(np.float32)
-    d0 = normals + NP.normal(0, 0.15, normals.shape).astype(np.float32)
+    # Hair leaves the scalp at a shallow angle and flows along the head
+    # toward the ground: blend the normal with the downhill surface tangent.
+    down = -up[None, :] - (normals @ -up)[:, None] * normals
+    down /= np.maximum(np.linalg.norm(down, axis=1, keepdims=True), 1e-6)
+    lift = 0.9 if style == "fur" else R.uniform(0.2, 0.45)
+    d0 = lift * normals + (1 - lift) * down + NP.normal(0, 0.08, normals.shape).astype(np.float32)
     d0 /= np.linalg.norm(d0, axis=1, keepdims=True)
     pts = np.zeros((n, n_pts, 3), np.float32)
     side = np.cross(d0, up)
@@ -598,8 +603,9 @@ def main():
     layers = [prim]
     for _ in range(R.choice([0, 0, 1, 1, 2])):
         o = pick(SECONDARY)()
-        o.location = (R.uniform(-0.4, 0.4), R.uniform(-0.6, -0.1), R.uniform(-0.3, 0.3))
-        o.scale = [R.uniform(0.6, 1.4)] * 3
+        side = R.choice([-1, 1])
+        o.location = (side * R.uniform(0.15, 0.6), R.uniform(-0.4, 0.3), R.uniform(-0.3, 0.3))
+        o.scale = [R.uniform(0.4, 1.0)] * 3
         animate(o, R.choice([0.0, 0.01, 0.03]))
         layers.append(o)
     META["speed"] = speed
