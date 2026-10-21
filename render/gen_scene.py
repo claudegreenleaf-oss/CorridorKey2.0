@@ -52,6 +52,7 @@ BG_SAMPLES = arg("bg_samples", 32, int)
 ASSETS = Path(os.path.expanduser(arg("assets", "~/babel/assets/ph")))
 THREADS = arg("threads", 32, int)
 DEVICE = arg("device", "CPU")
+FORCE_PRIMARY = arg("primary", -1, int)   # index into PRIMARY, for previews
 
 R = random.Random(SEED)
 NP = np.random.default_rng(SEED)
@@ -596,7 +597,7 @@ def main():
     sc = setup_scene()
     world_light()
 
-    prim = pick(PRIMARY)()
+    prim = (PRIMARY[FORCE_PRIMARY][0] if FORCE_PRIMARY >= 0 else pick(PRIMARY))()
     prim.rotation_euler = (R.uniform(-0.3, 0.3), R.uniform(-0.3, 0.3), R.uniform(-math.pi, math.pi))
     speed = R.choice([0.0, 0.01, 0.02, 0.05, 0.12])   # scene units per frame; 0.12 is a whip
     animate(prim, speed)
