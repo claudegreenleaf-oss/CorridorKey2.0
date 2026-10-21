@@ -220,6 +220,7 @@ def main():
     ap.add_argument("--sync_every", type=int, default=600)
     ap.add_argument("--sync_timeout", type=float, default=1800)
     ap.add_argument("--start_step", type=int, default=0, help="join a running job at this step")
+    ap.add_argument("--init_avg", type=Path, default=None, help="start from a coordinator average (joining worker)")
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
 
@@ -248,6 +249,13 @@ def main():
 
     if args.start_step and step == 0:
         step = args.start_step
+    if args.init_avg is not None:
+        st = torch.load(args.init_avg, map_location="cuda")
+        with torch.no_grad():
+            for n, p in named.items():
+                p.copy_(st["w"][n].to(p.dtype))
+                ema[n].copy_(st["ema"][n].float())
+        print(f"initialised from {args.init_avg}", flush=True)
     ds = KeyingClips(args.data, crop_hw=tuple(args.crop), T=args.T, seed=step + 1 + 1000003 * args.rank)
     dl = DataLoader(ds, batch_size=1, num_workers=args.workers, prefetch_factor=4,
                     persistent_workers=True, pin_memory=True)
