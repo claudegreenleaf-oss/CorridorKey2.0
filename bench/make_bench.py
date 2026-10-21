@@ -91,6 +91,29 @@ def _read_alpha(path):
     return a
 
 
+VM_SCREEN = np.array([0.12, 0.55, 0.15], np.float32)   # VideoMatte's green screens, linear
+
+
+def decontaminate_edges(fg_lin, alpha, screen=VM_SCREEN):
+    """Remove leftover screen color from a pulled foreground's edge pixels.
+
+    VideoMatte's foregrounds were keyed off green screens and some clips keep
+    a green cast in their soft edges. In the edge band, subtract screen-
+    colored light (F - k * screen) until each pixel's green chromaticity is
+    no higher than the nearby solid interior's. Solid pixels are untouched.
+    """
+    solid = (alpha > 0.99).astype(np.float32)
+    w = cv2.GaussianBlur(solid, (0, 0), 8)
+    ref = cv2.GaussianBlur(fg_lin * solid[..., None], (0, 0), 8) / np.maximum(w, 1e-4)[..., None]
+    s_f = fg_lin.sum(-1)
+    c_ref = np.where(w > 0.02, ref[..., 1] / np.maximum(ref.sum(-1), 1e-4), 1 / 3)
+    c_f = fg_lin[..., 1] / np.maximum(s_f, 1e-4)
+    # k solves chroma_g(F - k * screen) = c_ref
+    k = (fg_lin[..., 1] - c_ref * s_f) / np.maximum(screen[1] - c_ref * screen.sum(), 1e-4)
+    k = np.clip(k, 0, None) * ((c_f > c_ref) & (alpha < 0.99) & (alpha > 0))
+    return np.clip(fg_lin - k[..., None] * screen, 0, None)
+
+
 class VideoMatteClip:
     """VideoMatte240K_JPEG_HD/test/{fgr,pha}/<clip>/<frame>.jpg"""
 
@@ -104,7 +127,8 @@ class VideoMatteClip:
 
     def frame(self, i):
         i = min(i, len(self.fgr) - 1)
-        return srgb_to_lin(_read_rgb(self.fgr[i])), _read_alpha(self.pha[i])
+        a = _read_alpha(self.pha[i])
+        return decontaminate_edges(srgb_to_lin(_read_rgb(self.fgr[i])), a), a
 
 
 class Still:

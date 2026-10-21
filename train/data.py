@@ -27,7 +27,7 @@ from torch.utils.data import Dataset
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bench"))
 from make_bench import (  # noqa: E402
-    SCREEN, add_spill, affine, camera_noise, disk_kernel, green_wardrobe,
+    SCREEN, add_spill, affine, camera_noise, decontaminate_edges, disk_kernel, green_wardrobe,
     lin_to_srgb, make_backing, sharpen, smoke_layer, srgb_to_lin, warp,
     _read_alpha, _read_rgb,
 )
@@ -144,8 +144,8 @@ class KeyingClips(Dataset):
         flip = rng.random() < 0.5
         Ps, As = [], []
         for i in idx:
-            fg = srgb_to_lin(_read_rgb(fgr[i])[y0:y0 + ch, x0:x0 + cw])
             a = (a0 if i == idx[0] else _read_alpha(pha[i]))[y0:y0 + ch, x0:x0 + cw]
+            fg = decontaminate_edges(srgb_to_lin(_read_rgb(fgr[i])[y0:y0 + ch, x0:x0 + cw]), a)
             P = cv2.resize(fg * a[..., None], (W, H), interpolation=cv2.INTER_AREA)
             A = np.clip(cv2.resize(a, (W, H), interpolation=cv2.INTER_AREA), 0, 1)
             if flip:
