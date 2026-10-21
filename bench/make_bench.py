@@ -82,7 +82,11 @@ def _read_alpha(path):
     scale = 65535.0 if a.dtype == np.uint16 else 255.0
     a = a.astype(np.float32) / scale
     if a.ndim == 3:
-        a = a[..., 3] if a.shape[2] == 4 else a[..., 0]
+        # Some alpha PNGs are RGBA with a constant alpha channel and the matte in RGB.
+        if a.shape[2] == 4 and a[..., 3].min() < a[..., 3].max():
+            a = a[..., 3]
+        else:
+            a = a[..., 0]
     return a
 
 
@@ -146,7 +150,7 @@ def load_t460(data: Path, name: str) -> Still:
 # layer placement and motion
 # ---------------------------------------------------------------------------
 
-def place(fg_lin, alpha, H, W, height_frac=None, center=(0.5, 0.5)):
+def place(fg_lin, alpha, H, W, height_frac=None, center=(0.5, 0.5), overscan=1.0):
     """Fit a foreground layer onto an HxW canvas in premultiplied space.
 
     height_frac=None fills the canvas like a full frame (cover-crop);
@@ -155,7 +159,7 @@ def place(fg_lin, alpha, H, W, height_frac=None, center=(0.5, 0.5)):
     premult = fg_lin * alpha[..., None]
     h, w = alpha.shape
     if height_frac is None:
-        s = max(H / h, W / w)
+        s = max(H / h, W / w) * overscan
         cy, cx = h / 2, w / 2
         ty, tx = H / 2, W / 2
     else:
@@ -241,7 +245,7 @@ def make_backing(H, W, rng, screen="green", uneven=0.0, wrinkles=0.0,
         gain *= 1.0 + uneven * (0.6 * smooth_noise(H, W, max(H // 3, 8), rng) + ramp)
     if wrinkles:
         n = rng.standard_normal((H, W)).astype(np.float32)
-        n = ndimage.gaussian_filter(n, sigma=(3, 50))
+        n = ndimage.gaussian_filter(n, sigma=(10, 90))
         n /= n.std() + 1e-6
         n = ndimage.rotate(n, rng.uniform(-35, 35), reshape=False, mode="reflect")
         gain *= 1.0 + wrinkles * n
@@ -422,7 +426,7 @@ CASES = [
          fg_gain=3.0),
     dict(id="c14_animal_fur", why="Animal fur (AIM-500, foreground re-estimated), slow drift.",
          src=("aim", 0, 0), fmt="prores10", uneven=0.35, wrinkles=0.05, markers=6, spill=0.2,
-         iso=1.5, height_frac=0.8, drift=True),
+         iso=1.5, drift=True),
 ]
 
 
@@ -461,7 +465,8 @@ def build_case(case, data: Path, out: Path, frames: int, pick: dict):
     displays, linears = [], []
     for t in range(T):
         fg, a = src.frame(start + t)
-        P0, A0 = place(fg, a, H, W, case.get("height_frac"))
+        P0, A0 = place(fg, a, H, W, case.get("height_frac"),
+                       overscan=1.1 if case.get("drift") and not case.get("height_frac") else 1.0)
         if case.get("fg_gain"):
             # HDR: lift the subject's highlights well above 1.0
             Fl = P0 / np.maximum(A0, 1e-4)[..., None]
@@ -488,8 +493,8 @@ def build_case(case, data: Path, out: Path, frames: int, pick: dict):
             P /= subs
             A /= subs
         elif case.get("drift"):
-            P, A = warp(P0, A0, affine(tx=W * 0.004 * t, ty=H * 0.002 * np.sin(t / 6),
-                                       rot_deg=0.15 * t, cx=W / 2, cy=H / 2))
+            P, A = warp(P0, A0, affine(tx=W * 0.0015 * t, ty=H * 0.002 * np.sin(t / 6),
+                                       rot_deg=0.06 * t, cx=W / 2, cy=H / 2))
         else:
             P, A = P0, A0
 
