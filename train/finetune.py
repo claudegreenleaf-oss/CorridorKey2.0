@@ -297,12 +297,22 @@ def main():
             w_fg = ga * (ga > 0.01)
             lf_net = ((cu.linear_to_asinh(aux["f_net"]) - cu.linear_to_asinh(gf)).abs() * w_fg).sum() \
                 / w_fg.sum().clamp(min=1.0) / 3
-            loss = (la + lf + 2 * lc + 0.5 * lt + 0.25 * lf_net
+            # matte precision: no holes in solids, no haze in empty screen
+            with torch.no_grad():
+                solid = -F.max_pool2d(-(ga > 0.999).float(), 7, 1, 3)
+                empty = -F.max_pool2d(-(ga < 0.001).float(), 7, 1, 3)
+            l_prec = ((1 - a).clamp(min=0) * solid).sum() / solid.sum().clamp(min=1) \
+                + (a.clamp(min=0) * empty).sum() / empty.sum().clamp(min=1)
+            loss = (la + lf + 2 * lc + 0.5 * lt + 0.25 * lf_net + 5 * l_prec
                      + 0.25 * (la_b + lf_b + lc_b) + 0.25 * (la_x + lf_x + lc_x))
             (loss / args.accum).backward()
-            for k, v in (("alpha", la), ("fg", lf), ("comp", lc), ("temporal", lt), ("total", loss)):
-                run[k] = run.get(k, 0.0) + float(v) / args.accum
-        gn = torch.nn.utils.clip_grad_norm_(params, 1.0)
+            for k, v in (("alpha", la), ("fg", lf), ("comp", lc), ("temporal", lt), ("prec", l_prec),
+                         ("total", loss)):
+                run[k] = run.get(k, 0.0) + float(v.detach()) / args.accum
+        # Clip each group separately so the new modules' large early gradients
+        # cannot starve the pretrained stage-2 update.
+        gns = [float(torch.nn.utils.clip_grad_norm_(g["params"], 1.0)) for g in opt.param_groups]
+        gn = gns[1]
         opt.step()
         step += 1
         with torch.no_grad():
@@ -315,7 +325,8 @@ def main():
             dt = (time.time() - t_last) / 50
             t_last = time.time()
             msg = (f"step {step} " + " ".join(f"{k}={v / 50:.4f}" for k, v in run.items())
-                   + f" gnorm={float(gn):.3f} lr={opt.param_groups[1]['lr']:.2e} {dt:.2f}s/step")
+                   + " gnorm=" + "/".join(f"{x:.2f}" for x in gns)
+                   + f" lr={opt.param_groups[1]['lr']:.2e} {dt:.2f}s/step")
             print(msg, flush=True)
             log.write(msg + "\n")
             log.flush()

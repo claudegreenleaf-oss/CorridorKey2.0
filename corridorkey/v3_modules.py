@@ -14,6 +14,7 @@ KeyTail            full-resolution output tail, run in fp32:
                        blend weight, around the analytic 2.0-fix values.
 """
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -65,9 +66,12 @@ class EdgeRefiner(nn.Module):
         nn.init.zeros_(self.out.weight)
         nn.init.zeros_(self.out.bias)
 
-    def forward(self, rgb, alpha, fg, log_sigma, tokens):
+    def forward(self, rgb, alpha, fg, log_sigma, tokens, prescaled=False):
         H, W = rgb.shape[-2:]
-        t = F.interpolate(self.token_proj(tokens), size=(H, W), mode="bilinear", align_corners=False)
+        if prescaled:
+            t = self.token_proj(tokens)
+        else:
+            t = F.interpolate(self.token_proj(tokens), size=(H, W), mode="bilinear", align_corners=False)
         x = torch.cat([rgb, alpha, fg, log_sigma.expand(-1, 1, H, W), t], dim=1)
         x = F.gelu(self.inp(x))
         for blk in self.blocks:
@@ -116,8 +120,40 @@ class KeyTail(nn.Module):
         """rgb_asinh (N,3,H,W); logits (N,4,H,W) alpha + asinh FG; tokens (N,d,h,w).
 
         Returns final logits (N,4,H,W) with alpha and asinh-encoded fused FG, and
-        a dict of intermediates for losses.
+        a dict of intermediates for losses. At inference frames go one at a
+        time and the refiner runs in tiles, so peak memory is one frame's tail.
         """
+        if not torch.is_grad_enabled() and rgb_asinh.shape[0] > 1:
+            outs = [self.forward(rgb_asinh[i:i + 1], logits[i:i + 1], tokens[i:i + 1])[0]
+                    for i in range(rgb_asinh.shape[0])]
+            return torch.cat(outs, 0), None
+        return self._forward(rgb_asinh, logits, tokens, refine_band)
+
+    def _refine(self, rgb_asinh, a0, f0, log_sigma, tokens, tile=1024, halo=16):
+        H, W = rgb_asinh.shape[-2:]
+        if torch.is_grad_enabled() or H * W <= tile * tile:
+            return self.refiner(rgb_asinh, a0, f0, log_sigma, tokens)
+        # Tiled: tokens are upsampled per tile from a matching token window.
+        out = torch.zeros(a0.shape[0], 4, H, W, device=a0.device, dtype=a0.dtype)
+        th, tw = tokens.shape[-2:]
+        sy, sx = th / H, tw / W
+        for y0 in range(0, H, tile):
+            for x0 in range(0, W, tile):
+                y1, x1 = min(H, y0 + tile), min(W, x0 + tile)
+                ya, xa = max(0, y0 - halo), max(0, x0 - halo)
+                yb, xb = min(H, y1 + halo), min(W, x1 + halo)
+                # token window covering the pixel window (16-px tokens), resampled inside the refiner
+                ta, tb = int(ya * sy), max(int(ya * sy) + 1, int(np.ceil(yb * sy)))
+                tc, td = int(xa * sx), max(int(xa * sx) + 1, int(np.ceil(xb * sx)))
+                tok = tokens[..., ta:tb, tc:td]
+                tok = F.interpolate(tok, scale_factor=16, mode="bilinear", align_corners=False)
+                tok = tok[..., ya - ta * 16:yb - ta * 16, xa - tc * 16:xb - tc * 16]
+                d = self.refiner(rgb_asinh[..., ya:yb, xa:xb], a0[..., ya:yb, xa:xb],
+                                 f0[..., ya:yb, xa:xb], log_sigma, tok, prescaled=True)
+                out[..., y0:y1, x0:x1] = d[..., y0 - ya:y1 - ya, x0 - xa:x1 - xa]
+        return out
+
+    def _forward(self, rgb_asinh, logits, tokens, refine_band=None):
         rgb_asinh = rgb_asinh.float()
         logits = logits.float()
         tokens = tokens.float()
@@ -125,7 +161,7 @@ class KeyTail(nn.Module):
         a0 = logits[:, 0:1]
         f0 = logits[:, 1:4]
         log_sigma = screen_noise(plate, a0.detach().clamp(0, 1))
-        delta = self.refiner(rgb_asinh, a0, f0, log_sigma, tokens)
+        delta = self._refine(rgb_asinh, a0, f0, log_sigma, tokens)
         if refine_band is not None:
             delta = delta * refine_band
         alpha = a0 + delta[:, 0:1]
