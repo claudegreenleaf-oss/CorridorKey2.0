@@ -17,6 +17,7 @@ os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
 
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import cv2
@@ -52,23 +53,36 @@ def _encode_decode(frames_display, kind, crf, rng):
         return [np.round(np.clip(f, 0, 1) * 65535) / 65535 for f in frames_display]
     if kind == "prores10":
         enc = ["-c:v", "prores_ks", "-profile:v", str(rng.choice([2, 3])),
-               "-pix_fmt", "yuv422p10le", "-f", "mov"]
+               "-pix_fmt", "yuv422p10le"]
+        ext = ".mov"
     else:
         enc = ["-c:v", "libx264", "-crf", str(crf), "-preset", "veryfast",
-               "-pix_fmt", "yuv420p", "-f", "mp4", "-movflags", "frag_keyframe+empty_moov"]
+               "-pix_fmt", "yuv420p"]
+        ext = ".mp4"
+    tmp = tempfile.NamedTemporaryFile(suffix=ext, dir="/dev/shm" if os.path.isdir("/dev/shm") else None,
+                                      delete=False)
+    tmp.close()
     cmd = ["ffmpeg", "-v", "error", "-f", "rawvideo", "-pix_fmt", "rgb48le",
            "-s", f"{W}x{H}", "-r", "24", "-i", "-",
            "-vf", "scale=out_color_matrix=bt709:out_range=tv:flags=accurate_rnd+full_chroma_int",
-           *enc, "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709", "-"]
+           *enc, "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
+           "-y", tmp.name]
     raw = b"".join((np.clip(f, 0, 1) * 65535 + 0.5).astype("<u2").tobytes() for f in frames_display)
-    bitstream = subprocess.run(cmd, input=raw, capture_output=True, check=True).stdout
-    dec = ["ffmpeg", "-v", "error", "-i", "-",
+    try:
+        subprocess.run(cmd, input=raw, capture_output=True, check=True)
+        out = _decode(tmp.name)
+    finally:
+        os.unlink(tmp.name)
+    arr = np.frombuffer(out, dtype="<u2")[:T * H * W * 3].reshape(T, H, W, 3)
+    return list(arr.astype(np.float32) / 65535.0)
+
+
+def _decode(path):
+    dec = ["ffmpeg", "-v", "error", "-i", path,
            "-vf", "scale=in_color_matrix=bt709:in_range=tv:"
                   "flags=spline+accurate_rnd+full_chroma_int+full_chroma_inp",
            "-f", "rawvideo", "-pix_fmt", "rgb48le", "-"]
-    out = subprocess.run(dec, input=bitstream, capture_output=True, check=True).stdout
-    arr = np.frombuffer(out, dtype="<u2")[:T * H * W * 3].reshape(T, H, W, 3)
-    return list(arr.astype(np.float32) / 65535.0)
+    return subprocess.run(dec, capture_output=True, check=True).stdout
 
 
 class KeyingClips(Dataset):
