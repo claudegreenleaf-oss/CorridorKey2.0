@@ -72,15 +72,6 @@ def heat(err, scale=8.0):
     return cv2.cvtColor(cv2.applyColorMap(to8(e), cv2.COLORMAP_INFERNO), cv2.COLOR_BGR2RGB)
 
 
-def worst_window(err, win):
-    s = cv2.boxFilter(err.mean(-1), -1, (win, win), normalize=True)
-    y, x = np.unravel_index(np.argmax(s), s.shape)
-    H, W = s.shape
-    y0 = int(np.clip(y - win // 2, 0, H - win))
-    x0 = int(np.clip(x - win // 2, 0, W - win))
-    return y0, x0
-
-
 def render_case(case_dir, ra, rb, names, out_dir, t=None):
     meta = json.loads((case_dir / "case.json").read_text())
     gt_a = np.load(case_dir / "gt_alpha.npy", mmap_mode="r")
@@ -94,8 +85,7 @@ def render_case(case_dir, ra, rb, names, out_dir, t=None):
     e1, e2 = np.abs(c1 - c_gt), np.abs(c2 - c_gt)
 
     H, W = a_gt.shape
-    s = TILE_W / W
-    th = int(H * s)
+    th = int(H * TILE_W / W)
     small = lambda x: cv2.resize(to8(x), (TILE_W, th), interpolation=cv2.INTER_AREA)
     m1, m2 = e1.mean() * 255, e2.mean() * 255
     row1 = np.hstack([label(small(plate), "plate"),
@@ -103,22 +93,30 @@ def render_case(case_dir, ra, rb, names, out_dir, t=None):
                       label(small(c2), f"{names[1]}  err {m2:.2f}"),
                       label(small(c_gt), "ground truth")])
 
-    win = max(64, min(H, W) // 6)
-    y0, x0 = worst_window(e1, win)
-    crop = lambda x: cv2.resize(to8(x[y0:y0 + win, x0:x0 + win]), (th, th),
-                                interpolation=cv2.INTER_NEAREST)
-    pad = lambda img: np.pad(img, ((0, 0), (0, TILE_W - img.shape[1]), (0, 0)))
-    row2 = np.hstack([label(pad(crop(plate)), f"zoom x{th / win:.1f}"),
-                      label(pad(crop(c1)), names[0]),
-                      label(pad(crop(c2)), names[1]),
-                      label(pad(crop(c_gt)), "ground truth")])
-    he1, he2 = heat(e1), heat(e2)
-    row3 = np.hstack([label(cv2.resize(he1, (TILE_W, th)), f"{names[0]} error x8"),
-                      label(cv2.resize(he2, (TILE_W, th)), f"{names[1]} error x8"),
-                      label(pad(cv2.resize(he1[y0:y0 + win, x0:x0 + win], (th, th),
-                                           interpolation=cv2.INTER_NEAREST)), f"{names[0]} error, zoom"),
-                      label(pad(cv2.resize(he2[y0:y0 + win, x0:x0 + win], (th, th),
-                                           interpolation=cv2.INTER_NEAREST)), f"{names[1]} error, zoom")])
+    # Zoom on the hardest edge region for BOTH models (no cherry-picking):
+    # the window with the most combined error inside the GT edge band.
+    trans = ((a_gt > 1e-3) & (a_gt < 1 - 1e-3)).astype(np.uint8)
+    band = cv2.dilate(trans, np.ones((9, 9), np.uint8)).astype(np.float32)
+    wh = max(48, H // 7)
+    ww = int(wh * TILE_W / th)
+    score = cv2.boxFilter(((e1 + e2).mean(-1)) * band, -1, (ww, wh), normalize=True)
+    y, x = np.unravel_index(np.argmax(score), score.shape)
+    y0 = int(np.clip(y - wh // 2, 0, H - wh))
+    x0 = int(np.clip(x - ww // 2, 0, W - ww))
+    zoom = lambda img: cv2.resize(img[y0:y0 + wh, x0:x0 + ww], (TILE_W, th), interpolation=cv2.INTER_NEAREST)
+    z = f"zoom x{th / wh:.1f}"
+    row2 = np.hstack([label(zoom(to8(plate)), f"plate, {z}"),
+                      label(zoom(to8(c1)), f"{names[0]}, {z}"),
+                      label(zoom(to8(c2)), f"{names[1]}, {z}"),
+                      label(zoom(to8(c_gt)), f"ground truth, {z}")])
+
+    # Core matte, stretched: alpha 0.9..1.0 mapped to black..white, so
+    # near-solid "holes" and quantization steps become visible.
+    stretch = lambda a: np.repeat(np.clip((a - 0.9) / 0.1, 0, 1)[..., None], 3, 2)
+    row3 = np.hstack([label(cv2.resize(heat(e1, 16), (TILE_W, th)), f"{names[0]} composite error x16"),
+                      label(cv2.resize(heat(e2, 16), (TILE_W, th)), f"{names[1]} composite error x16"),
+                      label(small(stretch(a1)), f"{names[0]} matte 0.9-1.0 stretched"),
+                      label(small(stretch(a2)), f"{names[1]} matte 0.9-1.0 stretched")])
     sheet = np.vstack([row1, row2, row3])
     out = out_dir / f"{case_dir.name}.jpg"
     cv2.imwrite(str(out), cv2.cvtColor(sheet, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 90])
