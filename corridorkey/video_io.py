@@ -123,7 +123,7 @@ def crop_model_chw_to_output(x: np.ndarray, model_native_hw, pad, output_hw):
     return resize_chw_lanczos(cropped, output_hw)
 
 
-def read_image_rgb(path: str | os.PathLike):
+def read_image_rgb(path: str | os.PathLike, hi_bit: bool = False):
     path = str(path)
     if path.lower().endswith(".exr"):
         img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
@@ -135,10 +135,14 @@ def read_image_rgb(path: str | os.PathLike):
         if img.ndim == 3:
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         return img
-    img = cv2.imread(path, cv2.IMREAD_COLOR)
+    if hi_bit:
+        img = cv2.imread(path, cv2.IMREAD_ANYDEPTH | cv2.IMREAD_COLOR)
+    else:
+        img = cv2.imread(path, cv2.IMREAD_COLOR)
     if img is None:
         raise FileNotFoundError(path)
-    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    scale = 65535.0 if img.dtype == np.uint16 else 255.0
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / scale
 
 
 def read_hint_image(path: str | os.PathLike) -> np.ndarray:
@@ -244,8 +248,8 @@ def probe_video_meta(video_path: str, *, num_frames: int, shape_quantum: int,
     return meta
 
 
-def _read_frame_dir_views(path: str, *, exr_linear: bool):
-    raw = read_image_rgb(path)
+def _read_frame_dir_views(path: str, *, exr_linear: bool, hi_bit: bool = False):
+    raw = read_image_rgb(path, hi_bit=hi_bit)
     if exr_linear:
         linear = raw.astype(np.float32, copy=False)
         display = np.clip(cu.linear_to_srgb(np.maximum(linear, 0.0)), 0.0, 1.0)
@@ -296,10 +300,19 @@ def probe_frame_dir_meta(frame_dir: str, *, num_frames: int,
     return meta
 
 
+def model_dtype(meta: dict) -> torch.dtype:
+    return torch.float16 if meta.get("model_dtype") == "float16" else torch.bfloat16
+
+
 def preprocess_video_frame_views(frame_bgr, meta: dict, *, need_model: bool):
+    frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    return preprocess_video_rgb_views(frame, meta, need_model=need_model)
+
+
+def preprocess_video_rgb_views(frame, meta: dict, *, need_model: bool):
+    """`frame` is display-coded RGB float32 in [0, 1], HxWx3."""
     h_out, w_out = meta["shape_hw"]
     h_model, w_model = meta["model_native_hw"]
-    frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
     frame = resize_hwc_lanczos(frame, (h_model, w_model))
     frame, _ = center_pad_to_shape(frame, h_out, w_out)
     review = torch.from_numpy(frame.transpose(2, 0, 1)).to(dtype=torch.bfloat16)
@@ -316,7 +329,7 @@ def preprocess_video_frame_views(frame_bgr, meta: dict, *, need_model: bool):
     if not need_model:
         return None, foundation, review
     model = cu.linear_to_asinh(linear_model)
-    model_t = torch.from_numpy(model.transpose(2, 0, 1)).to(dtype=torch.bfloat16)
+    model_t = torch.from_numpy(model.transpose(2, 0, 1)).to(dtype=model_dtype(meta))
     return model_t, foundation, review
 
 
@@ -324,7 +337,8 @@ def preprocess_frame_dir_path(path: str, meta: dict, *, need_model: bool):
     h_out, w_out = meta["shape_hw"]
     h_model, w_model = meta["model_native_hw"]
     display, linear = _read_frame_dir_views(
-        path, exr_linear=bool(meta.get("exr_linear", False)))
+        path, exr_linear=bool(meta.get("exr_linear", False)),
+        hi_bit=meta.get("decode", "opencv") == "ffmpeg")
     display = resize_hwc_lanczos(display, (h_model, w_model))
     linear = resize_hwc_lanczos(linear, (h_model, w_model))
     display, _ = center_pad_to_shape(np.clip(display, 0.0, 1.0), h_out, w_out)
@@ -334,21 +348,93 @@ def preprocess_frame_dir_path(path: str, meta: dict, *, need_model: bool):
         return None, display_t, display_t
     linear, _ = center_pad_to_shape(linear, h_out, w_out)
     model = cu.linear_to_asinh(linear)
-    model_t = torch.from_numpy(model.transpose(2, 0, 1)).to(dtype=torch.bfloat16)
+    model_t = torch.from_numpy(model.transpose(2, 0, 1)).to(dtype=model_dtype(meta))
     return model_t, display_t, display_t
+
+
+_SCALE_MATRIX = {
+    "bt709": "bt709", "bt470bg": "bt601", "smpte170m": "bt601",
+    "bt2020nc": "bt2020", "bt2020c": "bt2020", "smpte240m": "smpte240m", "fcc": "fcc",
+}
+
+
+def _ffprobe_color(video_path: str, ffmpeg_bin: str = "ffmpeg") -> dict:
+    ffprobe = shutil.which("ffprobe") or str(Path(shutil.which(ffmpeg_bin) or ffmpeg_bin).with_name("ffprobe"))
+    out = subprocess.run(
+        [ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries",
+         "stream=width,height,pix_fmt,color_space,color_range", "-of", "default=nw=1",
+         video_path], capture_output=True, text=True, check=True).stdout
+    info = dict(line.split("=", 1) for line in out.strip().splitlines() if "=" in line)
+    return info
+
+
+class VideoRGBSource:
+    """Sequential decoder yielding display-coded RGB float32 frames in [0, 1].
+
+    decode="opencv" is the original path: cv2.VideoCapture, 8 bits per
+    channel, OpenCV's default YUV matrix and chroma upsampling.
+
+    decode="ffmpeg" pipes 16-bit RGB out of ffmpeg, keeping 10/12-bit sources
+    intact, using the stream's tagged YUV matrix and range (BT.709 assumed for
+    untagged HD), and upsampling chroma with a spline filter.
+    """
+
+    def __init__(self, video_path: str, meta: dict, start_frame: int = 0):
+        self.mode = meta.get("decode", "opencv")
+        self.video_path = video_path
+        if self.mode == "ffmpeg":
+            info = _ffprobe_color(video_path)
+            self.w, self.h = int(info["width"]), int(info["height"])
+            space = info.get("color_space", "unknown")
+            matrix = _SCALE_MATRIX.get(space, "bt709" if self.h >= 720 else "bt601")
+            pix = info.get("pix_fmt", "")
+            full = info.get("color_range") == "pc" or pix.startswith("yuvj")
+            in_range = "pc" if full else "tv"
+            vf = []
+            if start_frame:
+                vf.append(f"select=gte(n\\,{int(start_frame)})")
+            vf.append(f"scale=in_color_matrix={matrix}:in_range={in_range}:"
+                      "flags=spline+accurate_rnd+full_chroma_int+full_chroma_inp")
+            cmd = ["ffmpeg", "-v", "error", "-i", video_path, "-map", "0:v:0",
+                   "-vf", ",".join(vf), "-fps_mode", "passthrough",
+                   "-f", "rawvideo", "-pix_fmt", "rgb48le", "-"]
+            self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=1 << 24)
+            self.frame_bytes = self.w * self.h * 6
+        else:
+            self.cap = cv2.VideoCapture(video_path)
+            if not self.cap.isOpened():
+                raise RuntimeError(f"Could not open video: {video_path}")
+            if start_frame:
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, int(start_frame))
+
+    def read(self):
+        if self.mode == "ffmpeg":
+            buf = self.proc.stdout.read(self.frame_bytes)
+            if buf is None or len(buf) < self.frame_bytes:
+                return None
+            arr = np.frombuffer(buf, dtype="<u2").reshape(self.h, self.w, 3)
+            return arr.astype(np.float32) * (1.0 / 65535.0)
+        ret, frame = self.cap.read()
+        if not ret:
+            return None
+        return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+
+    def release(self):
+        if self.mode == "ffmpeg":
+            if self.proc.poll() is None:
+                self.proc.kill()
+            self.proc.wait()
+        else:
+            self.cap.release()
 
 
 class SequentialVideoWindowReader:
     def __init__(self, video_path: str, meta: dict):
         self.video_path = video_path
         self.meta = meta
-        self.cap = cv2.VideoCapture(video_path)
-        if not self.cap.isOpened():
-            raise RuntimeError(f"Could not open video: {video_path}")
         self.start_frame = int(meta["start_frame"])
         self.n_frames = int(meta["num_frames"])
-        if self.start_frame:
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.start_frame)
+        self.cap = VideoRGBSource(video_path, meta, self.start_frame)
         self.next_t = 0
         self.cache: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
@@ -357,12 +443,12 @@ class SequentialVideoWindowReader:
 
     def _read_until(self, t_end: int):
         while self.next_t < t_end:
-            ret, frame = self.cap.read()
-            if not ret:
+            frame = self.cap.read()
+            if frame is None:
                 raise RuntimeError(
                     f"{self.video_path}: failed decoding frame "
                     f"{self.start_frame + self.next_t}")
-            self.cache[self.next_t] = preprocess_video_frame_views(
+            self.cache[self.next_t] = preprocess_video_rgb_views(
                 frame, self.meta, need_model=True)
             self.next_t += 1
 
@@ -405,11 +491,7 @@ class SequentialFrameDirWindowReader:
 
 def iter_video_frame_chunks(video_path: str, meta: dict, *, chunk_size: int,
                             need_model: bool):
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open video: {video_path}")
-    if int(meta["start_frame"]):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(meta["start_frame"]))
+    cap = VideoRGBSource(video_path, meta, int(meta["start_frame"]))
     t = 0
     try:
         while t < int(meta["num_frames"]):
@@ -417,10 +499,10 @@ def iter_video_frame_chunks(video_path: str, meta: dict, *, chunk_size: int,
             foundation_list = []
             t0 = t
             while t < int(meta["num_frames"]) and len(foundation_list) < chunk_size:
-                ret, frame = cap.read()
-                if not ret:
+                frame = cap.read()
+                if frame is None:
                     break
-                model, foundation, _review = preprocess_video_frame_views(
+                model, foundation, _review = preprocess_video_rgb_views(
                     frame, meta, need_model=need_model)
                 if need_model:
                     model_list.append(model)

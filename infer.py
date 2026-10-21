@@ -98,6 +98,19 @@ def main():
                           "linear OpenEXR image sequences (full HDR float)."))
     ap.add_argument("--exr_dtype", choices=("half", "float"), default="half",
                     help="EXR pixel type for --output_format exr. Default: half.")
+    ap.add_argument("--decode", choices=("ffmpeg", "opencv"), default="opencv",
+                    help="Video decoder. ffmpeg: 16-bit RGB, honors the stream's "
+                         "YUV matrix/range, spline chroma upsampling (keeps 10/12-bit "
+                         "sources intact). opencv: the original 8-bit path.")
+    ap.add_argument("--precision", choices=("mixed", "bf16"), default="bf16",
+                    help="mixed: fp16 input storage, fp32 patch embeddings and "
+                         "fp32 output tail (removes 1/256 alpha steps). bf16: original.")
+    ap.add_argument("--plate_fg", action="store_true",
+                    help="Recover the foreground from the plate (screen subtraction) "
+                         "wherever alpha is solid enough; the model's foreground "
+                         "fills in thin, low-alpha edges.")
+    ap.add_argument("--plate_fg_lo", type=float, default=0.05)
+    ap.add_argument("--plate_fg_hi", type=float, default=0.6)
     ap.add_argument("--ffmpeg_bin", default="ffmpeg")
     ap.add_argument("--ffmpeg_codec", default="libx264")
     ap.add_argument("--crf", type=int, default=12)
@@ -165,6 +178,11 @@ def main():
         despill_strength=args.despill_strength,
         output_format=args.output_format,
         exr_dtype=args.exr_dtype,
+        decode=args.decode,
+        precision=args.precision,
+        plate_fg=args.plate_fg,
+        plate_fg_lo=args.plate_fg_lo,
+        plate_fg_hi=args.plate_fg_hi,
     )
     model = load_model(paths, device="cuda")
     run_inference(

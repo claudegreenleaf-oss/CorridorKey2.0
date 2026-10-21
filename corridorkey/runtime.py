@@ -14,6 +14,7 @@ import torch.nn.functional as F
 
 from . import color_utils as cu
 from .model import CorridorKeyV3
+from .plate_fg import plate_foreground
 from .video_io import (
     ExrSequenceWriter,
     ThreadedVideoWriter,
@@ -127,6 +128,13 @@ class InferenceConfig:
     despill_strength: float = 0.5
     output_format: str = "video"
     exr_dtype: str = "half"
+    # Fidelity options. The values here reproduce the original runtime;
+    # infer.py chooses the defaults users get.
+    decode: str = "opencv"          # "ffmpeg": 16-bit, tag-aware YUV decode
+    precision: str = "bf16"         # "mixed": fp16 input, fp32 stems and output tail
+    plate_fg: bool = False          # recover the foreground from the plate
+    plate_fg_lo: float = 0.05
+    plate_fg_hi: float = 0.6
 
 
 # Peak GPU memory in GiB by megapixels of model input, measured at each Hann
@@ -641,7 +649,8 @@ def _chw_to_bgra_f32_cpu(rgb: torch.Tensor, alpha: torch.Tensor) -> np.ndarray:
 
 def _render_predictions_exr_torch(meta: dict, outputs: set[str],
                                   checker: torch.Tensor,
-                                  logits: torch.Tensor) -> dict[str, np.ndarray]:
+                                  logits: torch.Tensor,
+                                  plate: torch.Tensor | None = None) -> dict[str, np.ndarray]:
     """Render a stage-2 batch as unclamped scene-linear float32 NHWC arrays.
 
     HDR contract: `fg`, `cutout`, and `checker` color stays in decoded linear
@@ -663,8 +672,7 @@ def _render_predictions_exr_torch(meta: dict, outputs: set[str],
         return rendered
 
     fg_model = logits[:, 1:4].float()
-    pf_model = _crop_native_torch(fg_model, meta)
-    pf_linear = _linear_adjust_inverse_torch(cu.asinh_to_linear(pf_model), meta)
+    pf_linear = _foreground_linear(meta, fg_model, pa_model, plate)
     pf_linear = _resize_output_torch(pf_linear, meta)
     if "fg" in outputs:
         rendered["fg"] = _chw_to_bgr_f32_cpu(pf_linear)
@@ -685,7 +693,8 @@ def _render_predictions_exr_torch(meta: dict, outputs: set[str],
 
 def _render_predictions_torch(meta: dict, outputs: set[str],
                               checker: torch.Tensor,
-                              logits: torch.Tensor) -> dict[str, np.ndarray]:
+                              logits: torch.Tensor,
+                              plate: torch.Tensor | None = None) -> dict[str, np.ndarray]:
     """Render a stage-2 batch on GPU, returning uint16 BGR/BGRA NHWC arrays.
 
     This removes the previous per-frame numpy HDR decode, sRGB encode,
@@ -703,8 +712,7 @@ def _render_predictions_torch(meta: dict, outputs: set[str],
         return rendered
 
     fg_model = logits[:, 1:4].float()
-    pf_model = _crop_native_torch(fg_model, meta)
-    pf_linear = _linear_adjust_inverse_torch(cu.asinh_to_linear(pf_model), meta)
+    pf_linear = _foreground_linear(meta, fg_model, pa_model, plate)
     pf_linear_pos = pf_linear.clamp(min=0.0)
     pf = _resize_output_torch(cu.linear_to_srgb(pf_linear_pos), meta).clamp(0.0, 1.0)
     if "fg" in outputs:
@@ -728,6 +736,27 @@ def _render_predictions_torch(meta: dict, outputs: set[str],
             comp_despill_lin.clamp(min=0.0)).clamp(0.0, 1.0)
         rendered["checker"] = _srgb_to_bgr_uint16_cpu(comp_despill)
     return rendered
+
+
+def configure_precision(model, precision: str) -> None:
+    precise = precision == "mixed"
+    model.stage1.precise_io = precise
+    model.stage2.precise_io = precise
+    if precise:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+
+def _foreground_linear(meta: dict, fg_logits: torch.Tensor, pa_model: torch.Tensor,
+                       plate_model: torch.Tensor | None) -> torch.Tensor:
+    """Cropped scene-linear foreground, optionally recovered from the plate."""
+    pf_model = _crop_native_torch(fg_logits, meta)
+    pf_linear = cu.asinh_to_linear(pf_model)
+    if meta.get("plate_fg") and plate_model is not None:
+        lo, hi = meta["plate_fg"]
+        plate_lin = cu.asinh_to_linear(_crop_native_torch(plate_model.float(), meta))
+        pf_linear = plate_foreground(plate_lin, pa_model, pf_linear, lo=lo, hi=hi)
+    return _linear_adjust_inverse_torch(pf_linear, meta)
 
 
 def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
@@ -760,6 +789,10 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
             linear_brightness=cfg.linear_brightness,
             linear_contrast=cfg.linear_contrast,
             linear_contrast_pivot=cfg.linear_contrast_pivot)
+    meta["decode"] = cfg.decode
+    meta["model_dtype"] = "float16" if cfg.precision == "mixed" else "bfloat16"
+    meta["plate_fg"] = (cfg.plate_fg_lo, cfg.plate_fg_hi) if cfg.plate_fg else None
+    configure_precision(model, cfg.precision)
     T_all = int(meta["num_frames"])
     H, W = meta["shape_hw"]
     if cfg.auto_vram:
@@ -889,7 +922,7 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
                         logits = logits[0]
                 render_fn = (_render_predictions_exr_torch if use_exr
                              else _render_predictions_torch)
-                rendered = render_fn(meta, cfg.outputs, checker_t, logits[0])
+                rendered = render_fn(meta, cfg.outputs, checker_t, logits[0], rgb_t[0])
                 for name, frames in rendered.items():
                     writers[name].write_many(frames)
                 del logits, baton_t, rgb_t, baton_np, rendered

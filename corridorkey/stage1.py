@@ -752,10 +752,15 @@ class Stage1(nn.Module):
         # Merge B·T for conv ops that don't care about T
         BT = B * T
         hint_quality = self._resolve_hint_quality(hint, hint_quality)
-        x_in = torch.cat([rgb, hint], dim=2).reshape(BT, 4, H, W)
+        x_in = torch.cat([rgb, hint.to(rgb.dtype)], dim=2).reshape(BT, 4, H, W)
 
-        # /1 → /16 patchify
-        f_16 = self.stem(x_in)                                   # (BT, d_16, H/16, W/16)
+        # /1 → /16 patchify. With precise_io the stem runs in fp32 so the
+        # 16x16 RGB patch basis is not first rounded to bfloat16.
+        if getattr(self, "precise_io", False):
+            with torch.autocast(x_in.device.type, enabled=False):
+                f_16 = self.stem(x_in.float())
+        else:
+            f_16 = self.stem(x_in)                               # (BT, d_16, H/16, W/16)
         del x_in
         f_16 = f_16.reshape(B, T, self.d_16, H // 16, W // 16)
         if mae_mask_16 is not None:

@@ -483,8 +483,19 @@ class Stage2(nn.Module):
         BT = B * T
         rgb_flat = rgb.reshape(BT, 3, H, W)
 
+        # precise_io: the RGB patch embeddings, the last blocks and the
+        # depatchify run in fp32 (TF32 matmuls). Under bfloat16 autocast the
+        # output itself is bfloat16, which quantizes alpha in [0.5, 1) to
+        # steps of 1/256.
+        precise = getattr(self, "precise_io", False)
+        fp32 = torch.autocast(rgb.device.type, enabled=False)
+
         # Patchify_1 (RGB → d_rgb at /16), then concatenate after the baton.
-        rgb_feat = self.patch_1(rgb_flat)                     # (BT, d_rgb, H/16, W/16)
+        if precise:
+            with fp32:
+                rgb_feat = self.patch_1(rgb_flat.float())
+        else:
+            rgb_feat = self.patch_1(rgb_flat)                 # (BT, d_rgb, H/16, W/16)
         rgb_feat = self._apply_mae_rgb_token(
             rgb_feat, mae_mask_16, B, T, "stage2 patch_1")
 
@@ -513,19 +524,31 @@ class Stage2(nn.Module):
             # is exactly zero at insertion, so the live zero-bias gate only
             # affects gradients until patch_2 wakes up.
             gate = F.silu(self.patch_2_gate(x))                # (BT, H/16, W/16, d_rgb)
-            patch2 = self.patch_2(rgb_flat)                    # (BT, d_rgb, H/16, W/16)
+            if precise:
+                with fp32:
+                    patch2 = self.patch_2(rgb_flat.float())
+            else:
+                patch2 = self.patch_2(rgb_flat)                # (BT, d_rgb, H/16, W/16)
             patch2 = patch2.permute(0, 2, 3, 1).contiguous() * gate
             x = x + F.pad(patch2, (self.d_baton, 0))
 
         # Post-patch_2 final blocks (num_final_blocks)
-        for blk in self.final_blocks:
-            x = run_block(blk, x)
+        if precise:
+            with fp32:
+                x = x.float()
+                for blk in self.final_blocks:
+                    x = run_block(blk, x)
+                feat_ch_first = x.permute(0, 3, 1, 2).contiguous()
+                out_raw = self.depatchify(feat_ch_first)
+        else:
+            for blk in self.final_blocks:
+                x = run_block(blk, x)
 
-        # Depatchify to /1. With production dims and non-overlap patching,
-        # FG rows are the exact inverse of patch_1 at init; alpha rows and
-        # baton columns are zero.
-        feat_ch_first = x.permute(0, 3, 1, 2).contiguous()     # (BT, d, H/16, W/16)
-        out_raw = self.depatchify(feat_ch_first)               # (BT, 4, H, W)
+            # Depatchify to /1. With production dims and non-overlap patching,
+            # FG rows are the exact inverse of patch_1 at init; alpha rows and
+            # baton columns are zero.
+            feat_ch_first = x.permute(0, 3, 1, 2).contiguous()     # (BT, d, H/16, W/16)
+            out_raw = self.depatchify(feat_ch_first)               # (BT, 4, H, W)
         if self.refine4 is not None:
             refined = out_raw + self.refine4(rgb_flat, feat_ch_first)
             return refined.reshape(B, T, 4, H, W), out_raw.reshape(B, T, 4, H, W)
