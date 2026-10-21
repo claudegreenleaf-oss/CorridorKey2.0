@@ -427,6 +427,9 @@ CASES = [
     dict(id="c14_animal_fur", why="Animal fur (AIM-500, foreground re-estimated), slow drift.",
          src=("aim", 0, 0), fmt="prores10", uneven=0.35, wrinkles=0.05, markers=6, spill=0.2,
          iso=1.5, drift=True),
+    dict(id="c15_hair_4k", why="Native UHD hair from a 4K source, real stage, ProRes 10-bit.",
+         src=("vm", 3, 300), fmt="prores10", res=(2160, 3840), frames=24, uneven=0.4,
+         wrinkles=0.05, markers=8, vignette=0.3, spill=0.2, iso=1.0),
 ]
 
 
