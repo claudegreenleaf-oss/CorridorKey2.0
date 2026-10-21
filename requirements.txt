@@ -1,5 +1,5 @@
 numpy>=1.26,<2
-opencv-python>=4.11
+opencv-python>=4.11,<5  # 5.0 wheels ship without the OpenEXR writer
 transformers>=4.57,<5
 timm>=1.0
 safetensors>=0.6
