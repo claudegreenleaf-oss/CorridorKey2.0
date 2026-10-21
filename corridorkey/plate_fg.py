@@ -15,6 +15,9 @@ filled in under the subject with a pull-push (normalized pyramid) solve.
 Where alpha is small, dividing by alpha amplifies any error in B, so the
 model's own foreground takes over: the two are blended in premultiplied space
 with weight smoothstep(lo, hi, alpha).
+
+The plate's foreground still carries the screen's bounce light (spill), so the
+result is despilled against the same backing estimate.
 """
 
 import torch
@@ -61,9 +64,35 @@ def _smoothstep(lo: float, hi: float, x: torch.Tensor) -> torch.Tensor:
     return t * t * (3.0 - 2.0 * t)
 
 
+def despill_backing(fg: torch.Tensor, backing: torch.Tensor, strength: float = 1.0) -> torch.Tensor:
+    """Remove screen-colored light from a straight linear foreground.
+
+    Spill is light of the backing's color added to the subject, so it is
+    removed as a multiple of the local backing color B: with d the backing's
+    dominant channel (green or blue) and o the other two,
+
+        k = max(0, F_d - max(F_o)) / (B_d - max(B_o)),   F' = F - k * B
+
+    which brings F_d down to max(F_o) along the backing's own color instead of
+    clipping one channel. Works for green and blue screens alike.
+    """
+    if strength <= 0:
+        return fg
+    dom = backing.mean(dim=(-2, -1), keepdim=True).argmax(dim=1, keepdim=True)   # (N,1,1,1)
+    dom = dom.expand(-1, 1, *fg.shape[-2:])
+    others = torch.stack([(dom + 1) % 3, (dom + 2) % 3], dim=0)
+    f_d = fg.gather(1, dom)
+    b_d = backing.gather(1, dom)
+    f_o = torch.maximum(fg.gather(1, others[0]), fg.gather(1, others[1]))
+    b_o = torch.maximum(backing.gather(1, others[0]), backing.gather(1, others[1]))
+    k = (f_d - f_o).clamp(min=0.0) / (b_d - b_o).clamp(min=1e-4)
+    return fg - strength * k * backing
+
+
 def plate_foreground(plate_linear: torch.Tensor, alpha: torch.Tensor,
                      fg_model_linear: torch.Tensor, lo: float = 0.05, hi: float = 0.6,
-                     backing: torch.Tensor | None = None) -> torch.Tensor:
+                     backing: torch.Tensor | None = None,
+                     despill: float = 1.0) -> torch.Tensor:
     """Straight (un-premultiplied) linear foreground.
 
     plate_linear, fg_model_linear: (N, 3, H, W) scene-linear; alpha: (N, 1, H, W).
@@ -76,4 +105,5 @@ def plate_foreground(plate_linear: torch.Tensor, alpha: torch.Tensor,
     premult_plate = plate_linear - (1.0 - alpha) * backing
     w = _smoothstep(lo, hi, alpha)
     premult = w * premult_plate + (1.0 - w) * alpha * fg_model_linear
-    return torch.where(alpha > 1e-3, premult / alpha.clamp(min=1e-3), fg_model_linear)
+    fg = torch.where(alpha > 1e-3, premult / alpha.clamp(min=1e-3), fg_model_linear)
+    return despill_backing(fg, backing, despill)

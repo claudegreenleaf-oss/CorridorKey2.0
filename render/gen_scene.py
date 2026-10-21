@@ -4,9 +4,12 @@ Run headless:
   blender -b --factory-startup -P render/gen_scene.py -- --seed 7 --out /data/clip_000007
 
 Per clip it writes
-  fg/0001.exr ...  subject only, transparent film: premultiplied scene-linear
-                   RGBA. Alpha and color are exact, with real motion blur,
+  fg/0001.exr ...  ground truth: the subject only, transparent film,
+                   premultiplied scene-linear RGBA, with no screen light on
+                   it. Alpha and color are exact, with real motion blur,
                    depth of field, hair, volumes and glass.
+  fg_spill/...     the same render with the screen bouncing light onto the
+                   subject (spill); this is what goes into the plate.
   bg/0001.exr ...  the backing as the camera sees it with the subject hidden,
                    including the subject's real shadow on the screen.
   meta.json        everything that was randomized.
@@ -14,7 +17,8 @@ Per clip it writes
 The green or blue screen is a real lit surface behind the subject. It is
 hidden from the camera in the foreground pass, but it still bounces light
 onto the subject, so spill and screen reflections are physically correct.
-The plate is then  plate = fg.rgb + (1 - fg.a) * bg,  exactly.
+The plate is then  plate = fg_spill.rgb + (1 - fg.a) * bg,  exactly, and the
+ground truth is fg (alpha and spill-free color).
 
 Subjects: procedural hair grooms (straight, wavy, curly, frizz, flyaways) on
 a head or on random shapes as fur, CC0 Poly Haven models (plants, dandelion,
@@ -653,14 +657,27 @@ def main():
     subjects = [o for o in bpy.data.objects
                 if o.type in ("MESH", "CURVES", "EMPTY") and o.name != "screen" and o.name != "cam"]
 
-    # --- pass 1: foreground (screen hidden from camera, still lights subject)
+    # Fixed sampling, so both foreground passes trace identical camera paths
+    # and their alphas match exactly.
+    sc.cycles.use_adaptive_sampling = False
+    sc.cycles.seed = SEED % 100000
+    OUT.mkdir(parents=True, exist_ok=True)
+    (OUT / "meta.json").write_text(json.dumps(META, indent=1))
+
+    # --- pass 1: foreground as the plate sees it: the screen is hidden from
+    # the camera but still bounces its light onto the subject (spill).
     screen.visible_camera = False
     screen.visible_transmission = False
     sc.cycles.samples = SAMPLES
-    sc.render.filepath = str(OUT / "fg" / "####")
-    OUT.mkdir(parents=True, exist_ok=True)
-    (OUT / "meta.json").write_text(json.dumps(META, indent=1))
+    sc.render.filepath = str(OUT / "fg_spill" / "####")
     bpy.ops.render.render(animation=True)
+
+    # --- pass 1b: ground-truth foreground, the same render with the screen
+    # removed entirely, so no screen light reaches the subject.
+    screen.hide_render = True
+    sc.render.filepath = str(OUT / "fg" / "####")
+    bpy.ops.render.render(animation=True)
+    screen.hide_render = False
 
     # --- pass 2: backing with the subject hidden but still casting shadows
     screen.visible_camera = True

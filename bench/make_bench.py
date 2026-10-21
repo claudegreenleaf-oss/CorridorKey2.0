@@ -10,8 +10,9 @@ truth is exact for every frame:
     gt      = alpha, F (+ the sensor noise that landed on the subject)
 
 Sensor noise is part of the subject as captured, so it is kept in the GT
-foreground: a compositor wants the plate's own grain on the subject. Codec and
-sharpening damage are not part of the GT.
+foreground: a compositor wants the plate's own grain on the subject. Screen
+spill, codec and sharpening damage are not part of the GT: the GT foreground
+is the subject without the screen's light on it.
 
 Sources (held-out test splits only, so the train splits stay free for
 fine-tuning):
@@ -270,7 +271,7 @@ def make_backing(H, W, rng, screen="green", uneven=0.0, wrinkles=0.0,
 def add_spill(P, A, B, strength):
     """Bounce light from the screen onto the subject, strongest near edges.
 
-    This is real light on the subject, so it stays in the GT foreground."""
+    It goes into the plate only; the GT foreground is the subject without it."""
     if strength <= 0:
         return P
     near_edge = ndimage.gaussian_filter(1.0 - A, sigma=max(A.shape[0] / 60, 4))
@@ -508,20 +509,25 @@ def build_case(case, data: Path, out: Path, frames: int, pick: dict):
                 P = cv2.filter2D(P, -1, k, borderType=cv2.BORDER_CONSTANT)
                 A = np.clip(cv2.filter2D(A, -1, k, borderType=cv2.BORDER_CONSTANT), 0, 1)
 
+        # Spill lands in the plate only. The ground truth is the subject as a
+        # compositor wants it: without the screen's light on it.
+        Pg = P
         P = add_spill(P, A, B, case.get("spill", 0.0))
 
         if case.get("smoke"):
             Ps, As = smoke_layer(H, W, smoke_rng, t, case["smoke"])
             P = Ps + (1 - As[..., None]) * P
+            Pg = Ps + (1 - As[..., None]) * Pg
             A = As + (1 - As) * A
 
         P = P * exposure
+        Pg = Pg * exposure
         Bt = B * exposure
         I = P + (1 - A[..., None]) * Bt
         n = camera_noise(I, rng, case.get("iso", 0.0))
         I_cam = I + n
 
-        F = np.where(A[..., None] > 1e-4, (P + A[..., None] * n) / np.maximum(A, 1e-4)[..., None], 0)
+        F = np.where(A[..., None] > 1e-4, (Pg + A[..., None] * n) / np.maximum(A, 1e-4)[..., None], 0)
         gt_a[t] = A
         gt_f[t] = np.clip(F, -65000, 65000)
 

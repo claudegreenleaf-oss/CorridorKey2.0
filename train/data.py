@@ -9,7 +9,7 @@ It uses the same stage and camera simulator as the benchmark
   VideoMatte240K_JPEG_HD/train   (the benchmark uses /test)
   Transparent-460/Train          (the benchmark uses /Test)
 
-Targets: alpha and the noise-free scene-linear foreground.
+Targets: alpha and the noise-free, spill-free scene-linear foreground.
 """
 
 import os
@@ -212,18 +212,21 @@ class KeyingClips(Dataset):
                 k = disk_kernel(defocus)
                 P = cv2.filter2D(P, -1, k, borderType=cv2.BORDER_CONSTANT)
                 A = np.clip(cv2.filter2D(A, -1, k, borderType=cv2.BORDER_CONSTANT), 0, 1)
+            Pg = P                      # GT: no screen light on the subject
             P = add_spill(P, A, B, spill)
             if smoke:
                 Psm, Asm = smoke_layer(H, W, smoke_rng, t, smoke)
                 P = Psm + (1 - Asm[..., None]) * P
+                Pg = Psm + (1 - Asm[..., None]) * Pg
                 A = Asm + (1 - Asm) * A
             P = P * exposure
+            Pg = Pg * exposure
             I = P + (1 - A[..., None]) * (B * exposure)
             I = I + camera_noise(I, rng, iso)
             d = sharpen(lin_to_srgb(I), sharp)
             disp.append(np.clip(d, 0, 1).astype(np.float32))
             gt_a.append(A.astype(np.float32))
-            gt_f.append(np.where(A[..., None] > 1e-4, P / np.maximum(A, 1e-4)[..., None], 0).astype(np.float32))
+            gt_f.append(np.where(A[..., None] > 1e-4, Pg / np.maximum(A, 1e-4)[..., None], 0).astype(np.float32))
 
         disp = _encode_decode(disp, kind, crf, rng)
         to_t = lambda xs: torch.from_numpy(np.stack(xs))

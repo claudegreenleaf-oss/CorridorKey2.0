@@ -135,6 +135,7 @@ class InferenceConfig:
     plate_fg: bool = False          # recover the foreground from the plate
     plate_fg_lo: float = 0.05
     plate_fg_hi: float = 0.6
+    plate_fg_despill: float = 1.0
 
 
 # Peak GPU memory in GiB by megapixels of model input, measured at each Hann
@@ -753,9 +754,9 @@ def _foreground_linear(meta: dict, fg_logits: torch.Tensor, pa_model: torch.Tens
     pf_model = _crop_native_torch(fg_logits, meta)
     pf_linear = cu.asinh_to_linear(pf_model)
     if meta.get("plate_fg") and plate_model is not None:
-        lo, hi = meta["plate_fg"]
+        lo, hi, despill = meta["plate_fg"]
         plate_lin = cu.asinh_to_linear(_crop_native_torch(plate_model.float(), meta))
-        pf_linear = plate_foreground(plate_lin, pa_model, pf_linear, lo=lo, hi=hi)
+        pf_linear = plate_foreground(plate_lin, pa_model, pf_linear, lo=lo, hi=hi, despill=despill)
     return _linear_adjust_inverse_torch(pf_linear, meta)
 
 
@@ -791,7 +792,7 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
             linear_contrast_pivot=cfg.linear_contrast_pivot)
     meta["decode"] = cfg.decode
     meta["model_dtype"] = "float16" if cfg.precision == "mixed" else "bfloat16"
-    meta["plate_fg"] = (cfg.plate_fg_lo, cfg.plate_fg_hi) if cfg.plate_fg else None
+    meta["plate_fg"] = (cfg.plate_fg_lo, cfg.plate_fg_hi, cfg.plate_fg_despill) if cfg.plate_fg else None
     configure_precision(model, cfg.precision)
     T_all = int(meta["num_frames"])
     H, W = meta["shape_hw"]

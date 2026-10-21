@@ -111,6 +111,8 @@ def main():
                          "fills in thin, low-alpha edges.")
     ap.add_argument("--plate_fg_lo", type=float, default=0.05)
     ap.add_argument("--plate_fg_hi", type=float, default=0.6)
+    ap.add_argument("--plate_fg_despill", type=float, default=1.0,
+                    help="With --plate_fg: remove screen-colored light (0 = keep spill).")
     ap.add_argument("--ffmpeg_bin", default="ffmpeg")
     ap.add_argument("--ffmpeg_codec", default="libx264")
     ap.add_argument("--crf", type=int, default=12)
@@ -183,6 +185,7 @@ def main():
         plate_fg=args.plate_fg,
         plate_fg_lo=args.plate_fg_lo,
         plate_fg_hi=args.plate_fg_hi,
+        plate_fg_despill=args.plate_fg_despill,
     )
     model = load_model(paths, device="cuda")
     run_inference(

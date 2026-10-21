@@ -34,8 +34,10 @@ free for fine-tuning:
 | c15_hair_4k | Native UHD hair from a 4K source on the real stage. |
 
 Sensor noise counts as part of the subject, so it stays in the ground-truth
-foreground. A compositor wants the plate's own grain on the subject. Codec and
-sharpening damage are not part of the ground truth.
+foreground. A compositor wants the plate's own grain on the subject. Screen
+spill, codec damage and sharpening are not part of the ground truth: the
+ground-truth foreground is the subject without the screen's light on it, so a
+keyer has to remove spill to score well.
 
 ## Metrics
 
