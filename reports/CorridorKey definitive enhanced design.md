@@ -321,3 +321,31 @@ A free, non-commercial, same-licence derivative is permissive for most inputs. T
 The research changes the question from "what bigger network" to "which pixels need a network at all". Keying with a known screen is one equation short. Recovering B more exactly, measuring sigma, and reading alpha where ‖F − B‖/sigma is large converts much of the problem from learned guesswork into arithmetic. The 665M trunk is then spent only on the genuinely ambiguous cases: low SNR, wardrobe that matches the screen, smoke, and deciding which object is the subject. That reframing also explains our preliminary numbers better than any architecture story, and it is why the enhanced model barely grows and still fits a 4 GB card. Even the 4K-on-4 GB problem dissolves once full-resolution detail comes from pixels instead of tokens.
 
 The expected losers are worth saying out loud. Glass will not improve much, because refraction breaks the compositing equation this design exploits. On natural-background public sets, MatAnyone 2 and the VideoMaMa pipelines may still win, because those sets measure general matting, not keying. The decisive early evidence costs almost nothing. The oracle-plate and oracle-projection tests (risks 1 and 2) take a day together and either confirm the design's foundation or redirect the training budget before a single GPU-day is spent.
+
+## Addendum, 2026-10-21: kill-test results and the revised design
+
+The two "run first" oracle checks were run on the corrected benchmark (results from the shipped weights with our inference fixes; `bench/oracle.py`, `bench/decompose.py`).
+
+**Physics alpha fails its kill test.** Even with oracle inputs (true backing, foreground colour pushed out from ground-truth solid pixels, screen-measured noise), the /1 projection alpha is 3 to 4 times worse than the network's alpha in the edge band. Edge MAE on the real-stage shot is 0.016 against the network's 0.0046, with similar ratios on motion blur, hair and fur. SNR fusion does not rescue it. The physics projection head and the TTT-Key mode (which relies on the same smooth-foreground assumption) are **removed** from the design.
+
+**The backing memory mostly fails its kill test.** Swapping the true clean screen into plate-recovered foreground moves composite error by 1 to 3% on most shots (real stage 0.920 to 0.915). The exception is smoke, 18% better (2.67 to 2.20). The full per-shot backing memory is **removed**; the cheap pull-push estimate stays, and smoke is addressed through training data instead.
+
+**Where the error actually is.** Splitting composite error into an alpha-only part (predicted alpha with GT foreground) and a foreground-only part (GT alpha with predicted foreground):
+
+| Shot | Total | Alpha part | FG part |
+|---|---|---|---|
+| Clean control | 0.18 | 0.17 | 0.02 (equals the plate floor) |
+| Real stage | 0.72 | 0.25 | 0.53 |
+| Camera H.264 | 1.69 | 0.21 | 1.54 |
+| Crushed web | 2.07 | 0.24 | 1.86 |
+| Smoke | 1.85 | 2.17 | 2.39 |
+| Glass | 1.72 | 1.74 | 0.70 |
+| Spider web 4K | 0.60 | 0.60 | 0.36 |
+| Fur | 2.74 | 0.36 | 2.86 |
+| Hair 4K | 1.10 | 0.20 | 0.93 |
+
+Alpha is already near its floor (about 0.2) except on smoke, glass, the web and fur. Everywhere else the error is foreground colour: residual spill, plus codec and sensor damage that lives in the plate. Our despilled plate foreground already beats a naive plate-recovered foreground by 3 to 5 times on every spill shot.
+
+**Revised design (supersedes the physics layer above).** Keep: the 16-bit decode, fp32 IO and output tail, plate-recovered foreground, the trunk and its three frozen foundations, stage-1 recurrence, stage-2 three-frame attention, refine4 plus the sparse confidence-routed refiner, the degradation side channel (noise map, chroma planes) into stage 2 and the tail, the CK-Critic, the training data plan and the benchmark protocol. Change: the learned **spill and foreground head** becomes the central addition, supervised exactly by Blender light-group renders (spill-free and spilled passes), replacing the physics projection; the confidence head routes the sparse refiner only. Training effort concentrates on smoke, glass, sub-pixel threads and fur (render curriculum) for alpha, and on spill removal under codec damage for foreground.
+
+**Budget constraint (from Thomas, 2026-10-21): $50 maximum cloud spend.** Training runs on the free a6000-box A6000 plus one Thunder Compute RTX A6000 ($0.35/hr, about 140 hours), with periodic weight averaging between the two, a box-side watchdog that deletes the instance before $50, and benchmark-scored checkpoints that stop the run when quality plateaus.
