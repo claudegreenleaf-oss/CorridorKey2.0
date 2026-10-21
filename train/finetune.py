@@ -56,6 +56,8 @@ def build_model(paths: RuntimePaths, refine4_blocks: int):
     if missing or unexpected:
         raise RuntimeError(f"checkpoint mismatch: missing={missing[:5]} unexpected={unexpected[:5]}")
     base_cfg.update(refine4_blocks=refine4_blocks, stage2_temporal_mix=True, stage2_key_tail=True)
+    model.stage1.cuda()
+    model.stage2.cuda()
     return model, base_cfg, ckpt.get("metadata", {})
 
 
