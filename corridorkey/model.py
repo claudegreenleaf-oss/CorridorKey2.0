@@ -111,6 +111,9 @@ class CorridorKeyV3(nn.Module):
         rope_jitter_coords: float = None,
         rope_rescale_coords: float = None,
         rope_base: float = 100.0,
+        # CorridorKey 3.0
+        stage2_temporal_mix: bool = False,
+        stage2_key_tail: bool = False,
     ):
         super().__init__()
         self.gradient_checkpoint = gradient_checkpoint
@@ -186,6 +189,8 @@ class CorridorKeyV3(nn.Module):
             rope_jitter_coords=rope_jitter_coords,
             rope_rescale_coords=rope_rescale_coords,
             rope_base=rope_base,
+            temporal_mix=stage2_temporal_mix,
+            key_tail=stage2_key_tail,
         )
 
     def forward(

@@ -24,6 +24,8 @@ is the tightest-possible attention shape for a 16K-token-per-frame budget
 (256 windows × 64 tokens squared = 1M entries per head per layer).
 """
 
+import contextlib
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -33,6 +35,7 @@ from .blocks import (
     LayerNorm2d, icnr_init_, init_orthogonal_rgb_passthrough_,
 )
 from .rope import RoPE2D
+from .v3_modules import KeyTail, TemporalTokenMix
 
 
 def _frontloaded_qkv_kernels(total: int, kernel: int,
@@ -325,6 +328,9 @@ class Stage2(nn.Module):
         rope_jitter_coords: float = None,
         rope_rescale_coords: float = None,
         rope_base: float = 100.0,
+        # CorridorKey 3.0 additions (zero-init; off reproduces 2.0)
+        temporal_mix: bool = False,
+        key_tail: bool = False,
     ):
         super().__init__()
         assert num_blocks >= 2, (
@@ -439,6 +445,9 @@ class Stage2(nn.Module):
         )
         if self.enable_mae_mask_tokens:
             self.mae_rgb_token = nn.Parameter(torch.zeros(self.d_rgb))
+        self.temporal_mix = TemporalTokenMix(d, num_heads=8) if temporal_mix else None
+        self.key_tail = KeyTail(d) if key_tail else None
+        self.tail_aux = None
 
     # -----------------------------------------------------------------
 
@@ -538,18 +547,28 @@ class Stage2(nn.Module):
                 x = x.float()
                 for blk in self.final_blocks:
                     x = run_block(blk, x)
+                if self.temporal_mix is not None:
+                    x = self.temporal_mix(x, B, T)
                 feat_ch_first = x.permute(0, 3, 1, 2).contiguous()
                 out_raw = self.depatchify(feat_ch_first)
         else:
             for blk in self.final_blocks:
                 x = run_block(blk, x)
+            if self.temporal_mix is not None:
+                x = self.temporal_mix(x, B, T)
 
             # Depatchify to /1. With production dims and non-overlap patching,
             # FG rows are the exact inverse of patch_1 at init; alpha rows and
             # baton columns are zero.
             feat_ch_first = x.permute(0, 3, 1, 2).contiguous()     # (BT, d, H/16, W/16)
             out_raw = self.depatchify(feat_ch_first)               # (BT, 4, H, W)
-        if self.refine4 is not None:
-            refined = out_raw + self.refine4(rgb_flat, feat_ch_first)
-            return refined.reshape(B, T, 4, H, W), out_raw.reshape(B, T, 4, H, W)
-        return out_raw.reshape(B, T, 4, H, W)
+        if self.refine4 is None and self.key_tail is None:
+            return out_raw.reshape(B, T, 4, H, W)
+        with (fp32 if precise or self.key_tail is not None else contextlib.nullcontext()):
+            refined = out_raw
+            if self.refine4 is not None:
+                refined = out_raw.float() + self.refine4(rgb_flat.float(), feat_ch_first.float())
+            if self.key_tail is not None:
+                refined, self.tail_aux = self.key_tail(rgb_flat, refined, feat_ch_first,
+                                                       refine_band=getattr(self, "refine_band", None))
+        return refined.reshape(B, T, 4, H, W), out_raw.reshape(B, T, 4, H, W)

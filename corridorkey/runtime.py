@@ -753,7 +753,7 @@ def _foreground_linear(meta: dict, fg_logits: torch.Tensor, pa_model: torch.Tens
     """Cropped scene-linear foreground, optionally recovered from the plate."""
     pf_model = _crop_native_torch(fg_logits, meta)
     pf_linear = cu.asinh_to_linear(pf_model)
-    if meta.get("plate_fg") and plate_model is not None:
+    if meta.get("plate_fg") and plate_model is not None and not meta.get("model_fuses_fg"):
         lo, hi, despill = meta["plate_fg"]
         plate_lin = cu.asinh_to_linear(_crop_native_torch(plate_model.float(), meta))
         pf_linear = plate_foreground(plate_lin, pa_model, pf_linear, lo=lo, hi=hi, despill=despill)
@@ -793,6 +793,7 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
     meta["decode"] = cfg.decode
     meta["model_dtype"] = "float16" if cfg.precision == "mixed" else "bfloat16"
     meta["plate_fg"] = (cfg.plate_fg_lo, cfg.plate_fg_hi, cfg.plate_fg_despill) if cfg.plate_fg else None
+    meta["model_fuses_fg"] = getattr(model.stage2, "key_tail", None) is not None
     configure_precision(model, cfg.precision)
     T_all = int(meta["num_frames"])
     H, W = meta["shape_hw"]
@@ -908,25 +909,39 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
 
         stage2_batch = max(1, int(cfg.stage2_batch))
 
+        temporal = getattr(model.stage2, "temporal_mix", None) is not None
+        group = max(stage2_batch, 4) if temporal else stage2_batch
+        carry = []   # last frame of the previous flush, as left context
+
         def write_prediction_batches(items):
+            nonlocal carry
             device = next(model.stage2.parameters()).device
-            for offset in range(0, len(items), stage2_batch):
-                sub = items[offset:offset + stage2_batch]
-                rgb_t = torch.stack([item[2] for item in sub], dim=0)
+            for offset in range(0, len(items), group):
+                sub = items[offset:offset + group]
+                # Temporal mix sees one frame of context on each side; context
+                # frames are run but their outputs are dropped.
+                left = (carry if offset == 0 else [items[offset - 1]]) if temporal else []
+                right = [items[offset + group]] if temporal and offset + group < len(items) else []
+                ctx = left + sub + right
+                rgb_t = torch.stack([item[2] for item in ctx], dim=0)
                 rgb_t = rgb_t.unsqueeze(0).to(device, non_blocking=True)
-                baton_np = np.stack([item[1] for item in sub], axis=0)
+                baton_np = np.stack([item[1] for item in ctx], axis=0)
                 baton_t = torch.from_numpy(baton_np).unsqueeze(0)
                 baton_t = baton_t.to(device, non_blocking=True).float()
                 with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
                     logits = model.stage2(rgb_t, baton_t)
                     if isinstance(logits, tuple):
                         logits = logits[0]
+                    logits = logits[:, len(left):len(left) + len(sub)]
+                    rgb_t = rgb_t[:, len(left):len(left) + len(sub)]
                 render_fn = (_render_predictions_exr_torch if use_exr
                              else _render_predictions_torch)
                 rendered = render_fn(meta, cfg.outputs, checker_t, logits[0], rgb_t[0])
                 for name, frames in rendered.items():
                     writers[name].write_many(frames)
                 del logits, baton_t, rgb_t, baton_np, rendered
+            if temporal and items:
+                carry = [items[-1]]
 
         hann_stage1_stream(
             model, input_path, meta, reader_cls=reader_cls,

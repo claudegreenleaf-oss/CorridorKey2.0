@@ -48,13 +48,14 @@ def build_model(paths: RuntimePaths, refine4_blocks: int):
     cfg.update(cradio_repo=str(paths.cradio_dir), moge_checkpoint=str(paths.moge_checkpoint),
                rvm_ckpt=str(paths.rvm_ckpt), foundation_stats_path=str(paths.foundation_stats),
                gradient_checkpoint=True, device="cuda", stage1_recurrent_64_sites=(),
-               refine4_blocks=refine4_blocks)
+               refine4_blocks=refine4_blocks, stage2_temporal_mix=True, stage2_key_tail=True)
     model = CorridorKeyV3(**cfg)
     missing, unexpected = model.load_state_dict(ckpt["state_dict"], strict=False)
-    missing = [k for k in missing if not k.startswith("foundations.") and "refine4" not in k]
+    new_parts = ("refine4", "temporal_mix", "key_tail")
+    missing = [k for k in missing if not k.startswith("foundations.") and not any(p in k for p in new_parts)]
     if missing or unexpected:
         raise RuntimeError(f"checkpoint mismatch: missing={missing[:5]} unexpected={unexpected[:5]}")
-    base_cfg["refine4_blocks"] = refine4_blocks
+    base_cfg.update(refine4_blocks=refine4_blocks, stage2_temporal_mix=True, stage2_key_tail=True)
     return model, base_cfg, ckpt.get("metadata", {})
 
 
@@ -64,7 +65,7 @@ def trainable_groups(model, lr):
         p.requires_grad_(False)
         if name.startswith("foundations."):
             continue
-        if "refine4" in name:
+        if any(k in name for k in ("refine4", "temporal_mix", "key_tail")):
             new.append(p)
         elif name.startswith("stage2."):
             stage2.append(p)
@@ -154,6 +155,29 @@ def degrade_hint(gt_a0, gen):
 # --------------------------------------------------------------------------
 
 
+def local_sgd_sync(named, ema, args, rnd):
+    """Average trainable weights (and their EMA) with the other workers."""
+    d = args.sync_dir
+    d.mkdir(parents=True, exist_ok=True)
+    mine = {n: p.detach().to("cpu", torch.float16) for n, p in named.items()}
+    tmp = d / f".w{args.rank}_r{rnd}.pt"
+    torch.save({"w": mine, "ema": {n: v.to("cpu", torch.float16) for n, v in ema.items()}}, tmp)
+    tmp.rename(d / f"w{args.rank}_r{rnd}.pt")
+    avg = d / f"avg_r{rnd}.pt"
+    t0 = time.time()
+    while not avg.exists() and time.time() - t0 < args.sync_timeout:
+        time.sleep(5)
+    if not avg.exists():
+        print(f"sync round {rnd}: no average after {args.sync_timeout:.0f}s, continuing alone", flush=True)
+        return
+    st = torch.load(avg, map_location="cuda")
+    with torch.no_grad():
+        for n, p in named.items():
+            p.copy_(st["w"][n].to(p.dtype))
+            ema[n].copy_(st["ema"][n].float())
+    print(f"sync round {rnd}: averaged over {st.get('n', '?')} workers", flush=True)
+
+
 def save_runtime(model, ema, cfg, metadata, path: Path):
     from safetensors.torch import save_file
     sd = {}
@@ -162,7 +186,7 @@ def save_runtime(model, ema, cfg, metadata, path: Path):
             continue
         sd[k] = (ema[k] if k in ema else v).detach().float().cpu().contiguous()
     meta = dict(metadata)
-    meta["public_model_name"] = "CorridorKey v2 (fidelity fine-tune)"
+    meta["public_model_name"] = "CorridorKey 3.0 (unofficial community fine-tune of CorridorKey 2.0)"
     save_file(sd, str(path), metadata={
         "format": "corridorkey_v2_runtime_checkpoint",
         "model_config": json.dumps(cfg),
@@ -177,20 +201,28 @@ def main():
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--steps", type=int, default=20000)
     ap.add_argument("--lr", type=float, default=2e-5)
-    ap.add_argument("--T", type=int, default=4)
-    ap.add_argument("--crop", type=int, nargs=2, default=(640, 1152))
+    ap.add_argument("--T", type=int, default=3)
+    ap.add_argument("--crop", type=int, nargs=2, default=(512, 896))
     ap.add_argument("--accum", type=int, default=2)
     ap.add_argument("--workers", type=int, default=24)
     ap.add_argument("--refine4_blocks", type=int, default=2)
     ap.add_argument("--hint_prob", type=float, default=0.3)
     ap.add_argument("--save_every", type=int, default=2000)
     ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--init", type=Path, default=None, help="start from these runtime weights instead of 2.0")
+    # local SGD across machines: every sync_every steps each worker writes its
+    # trainable weights to sync_dir/w<rank>_r<round>.pt and waits for
+    # sync_dir/avg_r<round>.pt from the coordinator (bench/../train/sync.py).
+    ap.add_argument("--sync_dir", type=Path, default=None)
+    ap.add_argument("--rank", type=int, default=0)
+    ap.add_argument("--sync_every", type=int, default=600)
+    ap.add_argument("--sync_timeout", type=float, default=1800)
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
 
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    paths = RuntimePaths.from_package(REPO, None)
+    paths = RuntimePaths.from_package(REPO, str(args.init) if args.init else None)
     model, cfg, metadata = build_model(paths, args.refine4_blocks)
     model.stage1.precise_io = True
     model.stage2.precise_io = True
@@ -259,7 +291,11 @@ def main():
             ax = out["alpha_aux"].float().reshape(B * T, 1, H // 2, W // 2)
             fx = out["fg_aux"].float().reshape(B * T, 3, H // 2, W // 2)
             la_x, lf_x, lc_x = keying_loss(ax, fx, ga, gf, bgs)
-            loss = (la + lf + 2 * lc + 0.5 * lt
+            aux = model.stage2.tail_aux
+            w_fg = ga * (ga > 0.01)
+            lf_net = ((cu.linear_to_asinh(aux["f_net"]) - cu.linear_to_asinh(gf)).abs() * w_fg).sum() \
+                / w_fg.sum().clamp(min=1.0) / 3
+            loss = (la + lf + 2 * lc + 0.5 * lt + 0.25 * lf_net
                      + 0.25 * (la_b + lf_b + lc_b) + 0.25 * (la_x + lf_x + lc_x))
             (loss / args.accum).backward()
             for k, v in (("alpha", la), ("fg", lf), ("comp", lc), ("temporal", lt), ("total", loss)):
@@ -271,6 +307,8 @@ def main():
             d = min(0.999, (1 + step) / (10 + step))
             for n, p in named.items():
                 ema[n].mul_(d).add_(p.detach().float(), alpha=1 - d)
+        if args.sync_dir is not None and step % args.sync_every == 0:
+            local_sgd_sync(named, ema, args, step // args.sync_every)
         if step % 50 == 0:
             dt = (time.time() - t_last) / 50
             t_last = time.time()
