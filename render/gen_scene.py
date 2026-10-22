@@ -6,7 +6,7 @@ Run headless:
 Per clip it writes
   fg/0001.exr ...  ground truth: the subject only, transparent film,
                    premultiplied scene-linear RGBA, with no screen light on
-                   it. Alpha and color are exact, with real motion blur,
+                   it (the screen is still there, as a black absorber). Alpha and color are exact, with real motion blur,
                    depth of field, hair, volumes and glass.
   fg_spill/...     the same render with the screen bouncing light onto the
                    subject (spill); this is what goes into the plate.
@@ -717,12 +717,23 @@ def main():
     sc.render.filepath = str(OUT / "fg_spill" / "####")
     bpy.ops.render.render(animation=True)
 
-    # --- pass 1b: ground-truth foreground, the same render with the screen
-    # removed entirely, so no screen light reaches the subject.
-    screen.hide_render = True
+    # --- pass 1b: ground-truth foreground. The screen stays where it is (it
+    # still blocks the world behind it) but becomes a perfect absorber, so the
+    # only light removed is the light coming off the screen: the spill.
+    # Removing the screen instead let the world light through and made the
+    # "spill-free" foreground brighter than the plate's.
+    black = bpy.data.materials.new("screen_absorber")
+    black.use_nodes = True
+    bn = black.node_tree
+    bn.nodes.clear()
+    em = bn.nodes.new("ShaderNodeEmission")
+    em.inputs["Strength"].default_value = 0.0
+    bn.links.new(em.outputs["Emission"], bn.nodes.new("ShaderNodeOutputMaterial").inputs["Surface"])
+    screen_mat = screen.data.materials[0]
+    screen.data.materials[0] = black
     sc.render.filepath = str(OUT / "fg" / "####")
     bpy.ops.render.render(animation=True)
-    screen.hide_render = False
+    screen.data.materials[0] = screen_mat
 
     # --- pass 2: backing with the subject hidden but still casting shadows
     screen.visible_camera = True

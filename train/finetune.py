@@ -121,21 +121,26 @@ def random_backgrounds(n, H, W, device, gen):
     return mix * flat.expand(-1, -1, H, W) + (1 - mix) * tex
 
 
-def keying_loss(alpha, fg_asinh, gt_a, gt_f, bgs):
-    """alpha (N,1,H,W) raw, fg_asinh (N,3,H,W), gt_a (N,1,H,W), gt_f linear (N,3,H,W)."""
+def keying_loss(alpha, fg_asinh, gt_a, gt_f, bgs, valid):
+    """alpha (N,1,H,W) raw, fg_asinh (N,3,H,W), gt_a (N,1,H,W), gt_f linear (N,3,H,W).
+
+    valid (N,1,H,W) is 0 where the plate is clipped: the foreground there is
+    not recoverable from the input, so it is left out of the colour losses.
+    """
     if alpha.shape[-2:] != gt_a.shape[-2:]:
         gt_f = F.interpolate(gt_f * gt_a, size=alpha.shape[-2:], mode="area")
         gt_a = F.interpolate(gt_a, size=alpha.shape[-2:], mode="area")
         gt_f = gt_f / gt_a.clamp(min=1e-4)
         bgs = F.interpolate(bgs, size=alpha.shape[-2:], mode="area")
+        valid = (F.interpolate(valid, size=alpha.shape[-2:], mode="area") > 0.999).float()
     l_a = (alpha - gt_a).abs().mean() + laplacian_loss(alpha, gt_a)
-    w = gt_a * (gt_a > 0.01)
+    w = gt_a * (gt_a > 0.01) * valid
     l_f = ((fg_asinh - cu.linear_to_asinh(gt_f)).abs() * w).sum() / w.sum().clamp(min=1.0) / 3
     a = alpha.clamp(0, 1)
     f_lin = cu.asinh_to_linear(fg_asinh)
     comp = cu.linear_to_srgb((a * f_lin + (1 - a) * bgs).clamp(min=0))
     comp_gt = cu.linear_to_srgb((gt_a * gt_f + (1 - gt_a) * bgs).clamp(min=0))
-    l_c = (comp - comp_gt).abs().mean()
+    l_c = ((comp - comp_gt).abs() * valid).sum() / valid.sum().clamp(min=1.0) / 3
     return l_a, l_f, l_c
 
 
@@ -173,9 +178,11 @@ def local_sgd_sync(named, ema, args, rnd):
         print(f"sync round {rnd}: no average after {args.sync_timeout:.0f}s, continuing alone", flush=True)
         return
     st = torch.load(avg, map_location="cuda")
+    # Move by (average - own fp16 copy): the fp16 transport rounding cancels,
+    # and a round averaged over this worker alone leaves the weights unchanged.
     with torch.no_grad():
         for n, p in named.items():
-            p.copy_(st["w"][n].to(p.dtype))
+            p.add_(st["w"][n].float() - mine[n].to("cuda").float())
     print(f"sync round {rnd}: averaged over {st.get('n', '?')} workers", flush=True)
 
 
@@ -201,7 +208,7 @@ def main():
     ap.add_argument("--data", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--steps", type=int, default=20000)
-    ap.add_argument("--lr", type=float, default=2e-5)
+    ap.add_argument("--lr", type=float, default=1e-5)
     ap.add_argument("--T", type=int, default=3)
     ap.add_argument("--crop", type=int, nargs=2, default=(512, 896))
     ap.add_argument("--accum", type=int, default=2)
@@ -233,7 +240,9 @@ def main():
     params = [p for g in groups for p in g["params"]]
     print(f"trainable params: {sum(p.numel() for p in params) / 1e6:.1f}M "
           f"(new {sum(p.numel() for p in groups[0]['params']) / 1e6:.2f}M)", flush=True)
-    opt = torch.optim.AdamW(groups, weight_decay=0.01, betas=(0.9, 0.99))
+    # beta2 0.999: with 0.99 the pretrained groups' gradient norms grew tenfold
+    # over 10k steps and the run diverged.
+    opt = torch.optim.AdamW(groups, weight_decay=0.01, betas=(0.9, 0.999))
     named = {n: p for n, p in model.named_parameters() if p.requires_grad}
     ema = {n: p.detach().clone().float() for n, p in named.items()}
     step = 0
@@ -293,18 +302,19 @@ def main():
             ga = gt_a.reshape(B * T, 1, H, W)
             gf = gt_f.reshape(B * T, 3, H, W)
             bgs = random_backgrounds(B * T, H, W, "cuda", gen)
+            valid = (disp.reshape(B * T, 3, H, W).amax(1, keepdim=True) < 0.995).float()
             a = out["alpha"].float().reshape(B * T, 1, H, W)
             f = out["fg"].float().reshape(B * T, 3, H, W)
-            la, lf, lc = keying_loss(a, f, ga, gf, bgs)
+            la, lf, lc = keying_loss(a, f, ga, gf, bgs, valid)
             lt = temporal_loss(a, ga, T)
             ab = out["alpha_base"].float().reshape(B * T, 1, H, W)
             fb = out["fg_base"].float().reshape(B * T, 3, H, W)
-            la_b, lf_b, lc_b = keying_loss(ab, fb, ga, gf, bgs)
+            la_b, lf_b, lc_b = keying_loss(ab, fb, ga, gf, bgs, valid)
             ax = out["alpha_aux"].float().reshape(B * T, 1, H // 2, W // 2)
             fx = out["fg_aux"].float().reshape(B * T, 3, H // 2, W // 2)
-            la_x, lf_x, lc_x = keying_loss(ax, fx, ga, gf, bgs)
+            la_x, lf_x, lc_x = keying_loss(ax, fx, ga, gf, bgs, valid)
             aux = model.stage2.tail_aux
-            w_fg = ga * (ga > 0.01)
+            w_fg = ga * (ga > 0.01) * valid
             lf_net = ((cu.linear_to_asinh(aux["f_net"]) - cu.linear_to_asinh(gf)).abs() * w_fg).sum() \
                 / w_fg.sum().clamp(min=1.0) / 3
             # matte precision: no holes in solids, no haze in empty screen

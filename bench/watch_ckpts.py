@@ -5,7 +5,8 @@ Runs on the home box next to training. Each new corridorkey_ft_<step>.safetensor
 in --ckpts is scored on the 1080p cases (the 4K cases do not fit beside the
 training job on one A6000), with the same fix flags as the "all" variant, and a
 row goes into <out>/progress.tsv. When the best mean comp_mae has not improved by
---min_gain over the last --patience checkpoints, the watcher writes the stop file
+--min_gain over the last --patience checkpoints, or the last two checkpoints are
+both more than --diverge worse than the best one, the watcher writes the stop file
 (the Thunder watchdog then deletes the cloud worker), stops the home training
 unit and restarts ComfyUI.
 """
@@ -31,9 +32,11 @@ def main():
     ap.add_argument("--bench", type=Path, default=Path.home() / "corridorkey/bench")
     ap.add_argument("--ckpts", type=Path, default=Path.home() / "corridorkey/ft/v3")
     ap.add_argument("--out", type=Path, default=Path.home() / "corridorkey/results_v3")
-    ap.add_argument("--reference", type=Path, default=Path.home() / "corridorkey/results/all/scores.json")
+    ap.add_argument("--reference", type=Path, default=Path.home() / "corridorkey/results2/all/scores.json",
+                    help="released 2.0 + fixes, scored on the current bench (results/ predates the rebuild)")
     ap.add_argument("--patience", type=int, default=3)
     ap.add_argument("--min_gain", type=float, default=0.01)
+    ap.add_argument("--diverge", type=float, default=0.10)
     ap.add_argument("--stop_file", type=Path, default=Path.home() / "corridorkey/STOP_THUNDER")
     ap.add_argument("--train_unit", default="ck-train")
     a = ap.parse_args()
@@ -78,15 +81,19 @@ def main():
         print(f"step {step}: comp_mae {cm:.4f} ({vs} vs released 2.0 + fixes)", flush=True)
         rows = [l.split("\t") for l in prog.read_text().splitlines()[1:] if l[:1].isdigit()]
         maes = [float(x[1]) for x in rows]
-        if len(maes) > a.patience:
-            before = min(maes[:-a.patience])
-            if min(maes[-a.patience:]) > before * (1 - a.min_gain):
-                print(f"plateau: no {a.min_gain:.0%} gain over {a.patience} checkpoints; stopping",
-                      flush=True)
-                a.stop_file.touch()
-                subprocess.run(["systemctl", "--user", "stop", a.train_unit])
-                subprocess.run(["systemctl", "--user", "start", "comfyui.service"])
-                return
+        best = rows[maes.index(min(maes))][0]
+        print(f"best so far: step {best}", flush=True)
+        reason = None
+        if len(maes) >= 3 and min(maes[-2:]) > min(maes) * (1 + a.diverge):
+            reason = f"diverging: last two checkpoints {a.diverge:.0%}+ worse than step {best}"
+        elif len(maes) > a.patience and min(maes[-a.patience:]) > min(maes[:-a.patience]) * (1 - a.min_gain):
+            reason = f"plateau: no {a.min_gain:.0%} gain over {a.patience} checkpoints"
+        if reason:
+            print(f"{reason}; stopping (best checkpoint: step {best})", flush=True)
+            a.stop_file.touch()
+            subprocess.run(["systemctl", "--user", "stop", a.train_unit])
+            subprocess.run(["systemctl", "--user", "start", "comfyui.service"])
+            return
 
 
 if __name__ == "__main__":
