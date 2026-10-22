@@ -59,6 +59,7 @@ def main():
         if not todo:
             if subprocess.run(["systemctl", "--user", "is-active", "-q", a.train_unit]).returncode:
                 print("training unit stopped and nothing left to score", flush=True)
+                subprocess.run(["systemctl", "--user", "start", "comfyui.service"])
                 return
             time.sleep(120)
             continue
