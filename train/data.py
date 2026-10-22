@@ -199,6 +199,16 @@ class KeyingClips(Dataset):
         gt = [rd(clip / "fg" / f"{f:04d}.exr") for f in fr]
         sp = [rd(clip / "fg_spill" / f"{f:04d}.exr") for f in fr]
         bg = [rd(clip / "bg" / f"{f:04d}.exr")[..., :3] for f in fr]
+        # The two foreground passes carry independent path-tracing noise
+        # (about 15% per pixel at 128 samples), so fg alone is a target whose
+        # noise the plate does not share. Screen spill is smooth, so take the
+        # GT as the plate's foreground minus an alpha-normalized blur of the
+        # spill: same mean, and exactly the plate's own noise.
+        for g, p in zip(gt, sp):
+            a = np.clip(g[..., 3], 0, 1)
+            ab = cv2.GaussianBlur(a, (0, 0), 3)
+            d = cv2.GaussianBlur(p[..., :3] - g[..., :3], (0, 0), 3) / np.maximum(ab, 1e-3)[..., None]
+            g[..., :3] = np.clip(p[..., :3] - a[..., None] * d, 0, None)
         h, w = gt[0].shape[:2]
         s = float(rng.uniform(max(H / h, W / w), max(H / h, W / w) * 1.6))
         nh, nw = int(np.ceil(h * s)), int(np.ceil(w * s))
